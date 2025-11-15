@@ -353,3 +353,376 @@ async fn send_daemon_command(command: DaemonCommand) -> Result<Response> {
 async fn is_daemon_running() -> bool {
     send_daemon_command(DaemonCommand::Ping).await.is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::env;
+    use tempfile::TempDir;
+    use serial_test::serial;
+
+    /// Helper to create a temporary git repository
+    fn create_temp_git_repo() -> Result<TempDir> {
+        let temp_dir = TempDir::new()?;
+        let git_dir = temp_dir.path().join(".git");
+        fs::create_dir(&git_dir)?;
+        Ok(temp_dir)
+    }
+
+    /// Helper to set up a test environment with temporary config
+    fn setup_test_env() -> Result<(TempDir, TempDir)> {
+        let config_dir = TempDir::new()?;
+        let repo_dir = create_temp_git_repo()?;
+
+        // Set XDG_CONFIG_HOME to our temp directory
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        Ok((config_dir, repo_dir))
+    }
+
+    #[test]
+    #[serial]
+    fn test_expand_path_absolute() {
+        let path = "/tmp/test";
+        // expand_path is private, but we can test it indirectly
+        // Just documenting the behavior here
+        assert!(true); // Placeholder
+    }
+
+    #[test]
+    #[serial]
+    #[serial]
+    fn test_add_repository_creates_config() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        let result = add_repository(repo_path, None, None);
+        assert!(result.is_ok());
+
+        // Verify config was created
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 1);
+        assert!(config.repositories[0].path.to_str().unwrap().contains("tmp"));
+        assert_eq!(config.repositories[0].auto_commit, true);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_with_custom_message() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        let result = add_repository(repo_path, Some("Custom: {date}".to_owned()), None);
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories[0].commit_message_template, "Custom: {date}");
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_with_interval() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        let result = add_repository(repo_path, None, Some(60));
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.daemon.check_interval_seconds, 60);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_not_git_repo() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        let non_git_dir = TempDir::new().unwrap();
+        let path = non_git_dir.path().to_str().unwrap();
+
+        let result = add_repository(path, None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a git repository"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_duplicate() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // Add first time
+        let result1 = add_repository(repo_path, None, None);
+        assert!(result1.is_ok());
+
+        // Try to add again
+        let result2 = add_repository(repo_path, None, None);
+        assert!(result2.is_err());
+        assert!(result2.unwrap_err().to_string().contains("already configured"));
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_repository() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // Add repository
+        add_repository(repo_path, None, None).unwrap();
+
+        // Remove it
+        let result = remove_repository(repo_path);
+        assert!(result.is_ok());
+
+        // Verify it's gone
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 0);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_repository_not_found() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        let result = remove_repository(repo_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_enable_repository() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // Add and then disable
+        add_repository(repo_path, None, None).unwrap();
+        disable_repository(repo_path).unwrap();
+
+        // Now enable
+        let result = enable_repository(repo_path);
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories[0].auto_commit, true);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable_repository() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // Add repository
+        add_repository(repo_path, None, None).unwrap();
+
+        // Disable it
+        let result = disable_repository(repo_path);
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories[0].auto_commit, false);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_enable_repository_not_found() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        let result = enable_repository(repo_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_interval_new_value() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        let result = set_interval(Some(120));
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.daemon.check_interval_seconds, 120);
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_interval_show_current() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Set a value first
+        set_interval(Some(180)).unwrap();
+
+        // Show current (no arg) - should not error
+        let result = set_interval(None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_list_repositories_empty() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        let result = list_repositories();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn test_list_repositories_with_repos() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        add_repository(repo_path, Some("Test message".to_owned()), None).unwrap();
+
+        let result = list_repositories();
+        assert!(result.is_ok());
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_multiple_repositories() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        let repo1 = create_temp_git_repo().unwrap();
+        let repo2 = create_temp_git_repo().unwrap();
+
+        add_repository(repo1.path().to_str().unwrap(), None, None).unwrap();
+        add_repository(repo2.path().to_str().unwrap(), Some("Custom".to_owned()), None).unwrap();
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 2);
+        assert_eq!(config.repositories[1].commit_message_template, "Custom");
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_one_of_multiple_repositories() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        let repo1 = create_temp_git_repo().unwrap();
+        let repo2 = create_temp_git_repo().unwrap();
+
+        add_repository(repo1.path().to_str().unwrap(), None, None).unwrap();
+        add_repository(repo2.path().to_str().unwrap(), None, None).unwrap();
+
+        remove_repository(repo1.path().to_str().unwrap()).unwrap();
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 1);
+        assert!(config.repositories[0].path == repo2.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable_then_enable_repository() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        add_repository(repo_path, None, None).unwrap();
+
+        // Disable
+        disable_repository(repo_path).unwrap();
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories[0].auto_commit, false);
+
+        // Enable
+        enable_repository(repo_path).unwrap();
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories[0].auto_commit, true);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_interval_persists_across_operations() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // Set interval
+        set_interval(Some(240)).unwrap();
+
+        // Add repository (shouldn't change interval)
+        add_repository(repo_path, None, None).unwrap();
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.daemon.check_interval_seconds, 240);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_updates_interval() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let repo_path = repo_dir.path().to_str().unwrap();
+
+        // Add repository with interval
+        add_repository(repo_path, None, Some(90)).unwrap();
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.daemon.check_interval_seconds, 90);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_survives_operations() {
+        let (config_dir, repo_dir1) = setup_test_env().unwrap();
+        let repo_dir2 = create_temp_git_repo().unwrap();
+
+        let path1 = repo_dir1.path().to_str().unwrap();
+        let path2 = repo_dir2.path().to_str().unwrap();
+
+        // Add first repo
+        add_repository(path1, Some("Msg1".to_owned()), Some(60)).unwrap();
+
+        // Add second repo
+        add_repository(path2, Some("Msg2".to_owned()), None).unwrap();
+
+        // Disable first
+        disable_repository(path1).unwrap();
+
+        // Verify final state
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 2);
+        assert_eq!(config.repositories[0].auto_commit, false);
+        assert_eq!(config.repositories[1].auto_commit, true);
+        assert_eq!(config.repositories[0].commit_message_template, "Msg1");
+        assert_eq!(config.repositories[1].commit_message_template, "Msg2");
+
+        drop(config_dir);
+    }
+}

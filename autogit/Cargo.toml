@@ -26,6 +26,10 @@ colored = "2.1"
 # Table formatting
 tabled = "0.15"
 
+[dev-dependencies]
+tempfile = "3.8"
+serial_test = "3.0"
+
 [build-dependencies]
 clap = { workspace = true }
 clap_complete = "4.5"
