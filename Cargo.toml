@@ -33,3 +33,6 @@ dialoguer = "0.11"
 
 # Async runtime (if needed later)
 tokio = { version = "1.40", features = ["full"] }
+
+[profile.release]
+strip = true
