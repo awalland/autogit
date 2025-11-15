@@ -5,11 +5,13 @@ Release:        1%{?dist}
 Summary:        Automatic git commit daemon with CLI configuration tool
 
 License:        WTFPL
-URL:            https://github.com/yourusername/autogit
-Source0:        %{name}-%{version}.tar.gz
+URL:            https://github.com/awalland/autogit
+Source0:        %{name}-%{version}.tar.zst
+Source1:        registry.tar.zst
 
 BuildRequires:  rust >= 1.70
 BuildRequires:  cargo
+BuildRequires:  cargo-packaging
 BuildRequires:  gcc
 BuildRequires:  openssl-devel
 BuildRequires:  libgit2-devel
@@ -30,10 +32,21 @@ Features:
 - Respects .gitconfig for commit author info
 
 %prep
-%setup -q
+%autosetup -p1 -a1 -n %{name}-%{version}
+
+# Set up cargo config to use vendored dependencies
+mkdir -p .cargo
+cat >.cargo/config.toml <<EOF
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
 
 %build
-# Build release binaries
+# Set cargo home and build release binaries
+export CARGO_HOME=$PWD/.cargo
 cargo build --release --locked
 
 %install
