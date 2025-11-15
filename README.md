@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/github/awalland/autogit/graph/badge.svg?token=P5GON3Z8VH)](https://codecov.io/github/awalland/autogit)
+
 # autogit
 
 Automatic git commit daemon with a simple CLI configuration tool.
