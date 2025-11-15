@@ -92,18 +92,6 @@ You can use the following placeholders in commit message templates:
 - `{date}`: Date only (e.g., "2025-11-15")
 - `{time}`: Time only (e.g., "14:30:00")
 
-## Features
-
-- 🔄 Automatic commits at configurable intervals
-- 📁 Monitor multiple git repositories
-- ⚙️ Simple CLI configuration interface
-- 🎨 Customizable commit message templates
-- 🔐 Respects your `.gitconfig` for commit author info
-- 📝 Structured logging with `tracing`
-- 🛡️ Graceful shutdown on SIGTERM/SIGINT
-- 🔃 Automatic `git pull --rebase` before committing to sync across devices
-- 🔥 Hot-reload configuration without restarting the daemon
-
 ## Building
 
 ```bash
@@ -175,7 +163,17 @@ systemctl --user status autogit-daemon
 journalctl --user -u autogit-daemon -f
 ```
 
-**Note:** The `systemctl --user import-environment SSH_AUTH_SOCK` command needs to be run every time you log in. Add it to your shell profile (`~/.bash_profile`, `~/.zprofile`) or desktop environment startup configuration (e.g., i3 config) to make it automatic.
+> **⚠️ IMPORTANT: SSH Agent Setup**
+>
+> If you use SSH for git operations, you need to ensure the daemon has access to your SSH agent:
+>
+> ```bash
+> systemctl --user import-environment SSH_AUTH_SOCK
+> ```
+>
+> This command must be run every time you log in. To make it automatic, add it to:
+> - Your shell profile (`~/.bash_profile`, `~/.zprofile`, `~/.bashrc`)
+> - Or your desktop environment startup configuration (e.g., i3 config, GNOME startup applications)
 
 ## Requirements
 
@@ -237,11 +235,3 @@ WTFPL - Do What The Fuck You Want To Public License
 
 See the [LICENSE](LICENSE) file for details.
 
-## TODO
-
-- [ ] Implement real-time file watching with `notify` crate for more responsive commits
-- [ ] Web UI for configuration
-- [ ] Commit hooks integration
-- [ ] Configurable command to execute when merge/rebase conflicts occur (e.g., send notification, run custom conflict resolution script)
-- [ ] Per-repository push/pull configuration (some repos may be local-only)
-- [ ] Support for multiple remotes
