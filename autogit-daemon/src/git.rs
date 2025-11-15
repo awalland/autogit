@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use autogit_shared::Repository;
 use git2::{Repository as GitRepository, Signature, IndexAddOption, Status, StatusOptions};
 use chrono::Local;
+use notify_rust::Notification;
 use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info, warn};
@@ -96,6 +97,14 @@ fn push_changes(repo: &GitRepository, repo_path: &std::path::Path) -> Result<boo
         // Push failed - log but continue (non-fatal)
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!("Push failed for {}: {}", repo_path.display(), stderr.trim());
+
+        // Send desktop notification
+        let _ = Notification::new()
+            .summary("Git Push Failed")
+            .body(&format!("Repository: {}\n\nError:\n{}", repo_path.display(), stderr.trim()))
+            .appname(env!("CARGO_PKG_NAME"))
+            .show();
+
         Ok(false)
     }
 }
@@ -145,6 +154,13 @@ fn pull_rebase(repo: &GitRepository, repo_path: &std::path::Path) -> Result<bool
         // Pull failed - try to abort rebase to clean up
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!("Pull --rebase failed for {}: {}", repo_path.display(), stderr.trim());
+
+        // Send desktop notification
+        let _ = Notification::new()
+            .summary("Git Pull Failed")
+            .body(&format!("Repository: {}\n\nError:\n{}", repo_path.display(), stderr.trim()))
+            .appname(env!("CARGO_PKG_NAME"))
+            .show();
 
         // Try to abort the rebase to leave repo in clean state
         let abort_result = Command::new("git")

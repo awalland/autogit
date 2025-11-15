@@ -31,3 +31,6 @@ tokio.workspace = true
 
 # Time handling
 chrono = "0.4"
+
+# Desktop notifications
+notify-rust = "4"
