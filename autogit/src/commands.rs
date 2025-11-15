@@ -27,7 +27,7 @@ pub fn add_repository(path: &str, message: Option<String>, interval: Option<u64>
     let repo = Repository {
         path: repo_path.clone(),
         auto_commit: true,
-        commit_message_template: message.unwrap_or_else(|| "Auto-commit: {timestamp}".to_string()),
+        commit_message_template: message.unwrap_or_else(|| "Auto-commit: {timestamp}".to_owned()),
     };
 
     config.repositories.push(repo);
@@ -91,9 +91,9 @@ pub fn list_repositories() -> Result<()> {
     let rows: Vec<RepoRow> = config.repositories.iter().map(|r| {
         RepoRow {
             status: if r.auto_commit {
-                "✓ Enabled".to_string()
+                "✓ Enabled".to_owned()
             } else {
-                "✗ Disabled".to_string()
+                "✗ Disabled".to_owned()
             },
             path: r.path.display().to_string(),
             message: r.commit_message_template.clone(),
@@ -214,7 +214,7 @@ pub fn edit_config() -> Result<()> {
     let _ = Config::load_or_create_default()?;
 
     let editor = std::env::var("EDITOR")
-        .unwrap_or_else(|_| "vi".to_string());
+        .unwrap_or_else(|_| "vi".to_owned());
 
     println!("Opening {} in {}...", config_path.display(), editor);
 
@@ -249,7 +249,7 @@ pub fn trigger_now() -> Result<()> {
     let pid_str = String::from_utf8(pid_output.stdout)
         .context("Invalid UTF-8 in PID output")?
         .trim()
-        .to_string();
+        .to_owned();
 
     let pid: i32 = pid_str.parse()
         .with_context(|| format!("Invalid PID: {}", pid_str))?;

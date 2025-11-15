@@ -53,7 +53,7 @@ fn default_true() -> bool {
 }
 
 fn default_commit_message() -> String {
-    "Auto-commit: {timestamp}".to_string()
+    "Auto-commit: {timestamp}".to_owned()
 }
 
 impl Config {
@@ -130,7 +130,7 @@ mod tests {
                 Repository {
                     path: PathBuf::from("/home/user/notes"),
                     auto_commit: true,
-                    commit_message_template: "Auto-commit: {timestamp}".to_string(),
+                    commit_message_template: "Auto-commit: {timestamp}".to_owned(),
                 },
             ],
         };
