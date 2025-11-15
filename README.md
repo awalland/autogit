@@ -106,8 +106,6 @@ You can use the following placeholders in commit message templates:
 
 ## Building
 
-### Building from Source
-
 ```bash
 cargo build --release
 ```
@@ -116,52 +114,7 @@ The binaries will be available at:
 - `target/release/autogit-daemon`
 - `target/release/autogit`
 
-### Building RPM Package
-
-For RPM-based distributions (Fedora, RHEL, openSUSE, etc.):
-
-```bash
-# Install build dependencies
-sudo dnf install rpm-build rpmdevtools rust cargo gcc openssl-devel libgit2-devel
-
-# Build the RPM (version is automatically read from Cargo.toml)
-./build-rpm.sh
-```
-
-The script will:
-1. Create the source tarball
-2. Set up RPM build directories
-3. Build the RPM package
-4. Output the location of the built RPM
-
-Install the generated RPM:
-
-```bash
-# Find the built RPM (output by build-rpm.sh)
-sudo dnf install ~/rpmbuild/RPMS/x86_64/autogit-*.rpm
-
-# Or with rpm directly
-sudo rpm -ivh ~/rpmbuild/RPMS/x86_64/autogit-*.rpm
-```
-
 ## Installation
-
-### From RPM Package
-
-If you built or downloaded an RPM package:
-
-```bash
-sudo dnf install autogit-*.rpm
-```
-
-After installation, enable the daemon:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now autogit-daemon
-```
-
-### Manual Installation
 
 ```bash
 # Build the project
