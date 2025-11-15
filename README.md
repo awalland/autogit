@@ -1,5 +1,5 @@
 [![codecov](https://codecov.io/github/awalland/autogit/graph/badge.svg?token=P5GON3Z8VH)](https://codecov.io/github/awalland/autogit)
-
+[![Rust](https://github.com/awalland/autogit/actions/workflows/rust.yml/badge.svg)](https://github.com/awalland/autogit/actions/workflows/rust.yml)
 # autogit
 
 Automatic git commit daemon with a simple CLI configuration tool.
