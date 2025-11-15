@@ -413,4 +413,203 @@ mod tests {
         assert!(message.contains("Changes on "));
         assert!(message.contains(" at "));
     }
+
+    #[test]
+    fn test_format_timestamp_placeholder() {
+        let template = "{timestamp}";
+        let message = format_commit_message(template);
+
+        // Should match format: YYYY-MM-DD HH:MM:SS
+        assert!(message.len() == 19); // "2025-11-15 20:30:45" format
+        assert!(message.contains('-'));
+        assert!(message.contains(':'));
+        assert!(message.contains(' '));
+    }
+
+    #[test]
+    fn test_format_date_placeholder() {
+        let template = "{date}";
+        let message = format_commit_message(template);
+
+        // Should match format: YYYY-MM-DD
+        assert!(message.len() == 10);
+        assert_eq!(message.chars().filter(|&c| c == '-').count(), 2);
+    }
+
+    #[test]
+    fn test_format_time_placeholder() {
+        let template = "{time}";
+        let message = format_commit_message(template);
+
+        // Should match format: HH:MM:SS
+        assert!(message.len() == 8);
+        assert_eq!(message.chars().filter(|&c| c == ':').count(), 2);
+    }
+
+    #[test]
+    fn test_format_no_placeholders() {
+        let template = "Simple commit message";
+        let message = format_commit_message(template);
+        assert_eq!(message, template);
+    }
+
+    #[test]
+    fn test_format_multiple_same_placeholder() {
+        let template = "{date} - {date}";
+        let message = format_commit_message(template);
+
+        let parts: Vec<&str> = message.split(" - ").collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], parts[1]); // Should be same date
+    }
+
+    #[test]
+    fn test_format_all_placeholders() {
+        let template = "ts:{timestamp} d:{date} t:{time}";
+        let message = format_commit_message(template);
+
+        assert!(message.starts_with("ts:"));
+        assert!(message.contains(" d:"));
+        assert!(message.contains(" t:"));
+    }
+
+    #[test]
+    fn test_format_empty_template() {
+        let template = "";
+        let message = format_commit_message(template);
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn test_format_special_characters() {
+        let template = "Commit @{timestamp}!";
+        let message = format_commit_message(template);
+        assert!(message.starts_with("Commit @"));
+        assert!(message.ends_with('!'));
+    }
+
+    #[test]
+    fn test_format_unicode() {
+        let template = "✓ Update {date}";
+        let message = format_commit_message(template);
+        assert!(message.starts_with("✓ Update "));
+    }
+
+    #[test]
+    fn test_format_multiline() {
+        let template = "First line\nDate: {date}\nTime: {time}";
+        let message = format_commit_message(template);
+        assert!(message.contains("First line\n"));
+        assert!(message.contains("Date: "));
+        assert!(message.contains("Time: "));
+    }
+
+    #[test]
+    fn test_format_with_braces() {
+        let template = "Update {{not a placeholder}} {date}";
+        let message = format_commit_message(template);
+        // Double braces are not placeholders
+        assert!(message.contains("{{not a placeholder}}"));
+    }
+
+    #[test]
+    fn test_format_partial_placeholder() {
+        let template = "{dat} {timestamps}";
+        let message = format_commit_message(template);
+        // Partial matches should not be replaced
+        assert_eq!(message, "{dat} {timestamps}");
+    }
+
+    #[test]
+    fn test_format_consistency() {
+        let template = "{timestamp}";
+        let message1 = format_commit_message(template);
+
+        // Wait a tiny bit to ensure time might change
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let message2 = format_commit_message(template);
+
+        // Messages should be close in time (format is stable)
+        assert!(message1.len() == message2.len());
+    }
+
+    #[test]
+    fn test_format_realistic_templates() {
+        let templates = vec![
+            "Auto-commit: {timestamp}",
+            "Journal update: {date}",
+            "Daily backup {time}",
+            "Checkpoint at {date} {time}",
+            "WIP",
+            "Update documentation",
+            "{date}: Work in progress",
+        ];
+
+        for template in templates {
+            let message = format_commit_message(template);
+            assert!(!message.is_empty());
+
+            // If template had placeholders, message should be different
+            if template.contains('{') {
+                assert_ne!(message, template);
+            } else {
+                assert_eq!(message, template);
+            }
+        }
+    }
+
+    #[test]
+    fn test_format_date_format() {
+        let template = "{date}";
+        let message = format_commit_message(template);
+
+        // Verify it's a valid date format YYYY-MM-DD
+        let parts: Vec<&str> = message.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 4); // Year
+        assert_eq!(parts[1].len(), 2); // Month
+        assert_eq!(parts[2].len(), 2); // Day
+    }
+
+    #[test]
+    fn test_format_time_format() {
+        let template = "{time}";
+        let message = format_commit_message(template);
+
+        // Verify it's a valid time format HH:MM:SS
+        let parts: Vec<&str> = message.split(':').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 2); // Hour
+        assert_eq!(parts[1].len(), 2); // Minute
+        assert_eq!(parts[2].len(), 2); // Second
+    }
+
+    #[test]
+    fn test_format_timestamp_format() {
+        let template = "{timestamp}";
+        let message = format_commit_message(template);
+
+        // Verify format: YYYY-MM-DD HH:MM:SS
+        let parts: Vec<&str> = message.split(' ').collect();
+        assert_eq!(parts.len(), 2);
+
+        // Date part
+        let date_parts: Vec<&str> = parts[0].split('-').collect();
+        assert_eq!(date_parts.len(), 3);
+
+        // Time part
+        let time_parts: Vec<&str> = parts[1].split(':').collect();
+        assert_eq!(time_parts.len(), 3);
+    }
+
+    #[test]
+    fn test_format_preserves_whitespace() {
+        let template = "  {date}  {time}  ";
+        let message = format_commit_message(template);
+
+        assert!(message.starts_with("  "));
+        assert!(message.ends_with("  "));
+        assert!(message.contains("  ")); // Multiple spaces preserved
+    }
 }
