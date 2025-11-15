@@ -186,8 +186,25 @@ pub fn show_status() -> Result<()> {
     let config_path = Config::default_config_path()?;
     let config = Config::load_or_create_default()?;
 
+    // Check daemon status
+    let daemon_running = Command::new("systemctl")
+        .args(&["--user", "is-active", "autogit-daemon"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
     println!("{}", "autogit Configuration".bold().underline());
-    println!("\n{} Config file: {}", "→".blue(), config_path.display());
+
+    // Show daemon status
+    print!("\n{} Daemon status: ", "→".blue());
+    if daemon_running {
+        println!("{}", "running".green());
+    } else {
+        println!("{}", "not running".red());
+        println!("   Start with: systemctl --user start autogit-daemon");
+    }
+
+    println!("{} Config file: {}", "→".blue(), config_path.display());
     println!("{} Check interval: {} seconds", "→".blue(), config.daemon.check_interval_seconds);
     println!("{} Repositories: {}", "→".blue(), config.repositories.len());
 
