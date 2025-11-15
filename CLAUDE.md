@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **autogit-daemon**: Background daemon that monitors git repositories and automatically commits/pushes changes at intervals
 - **autogit**: CLI tool for configuring the daemon (add/remove repos, set intervals, trigger manual runs)
-- **autogit-shared**: Shared configuration types and TOML serialization logic
+- **autogit-shared**: Shared configuration types, TOML serialization, and daemon communication protocol (Unix socket)
 
 ## Architecture
 
@@ -21,16 +21,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 1. **Configuration**: Both daemon and CLI read/write `~/.config/autogit/config.toml` (managed by `autogit-shared`)
 2. **Hot-reload**: Daemon uses `notify` crate to watch config file for changes and reloads automatically
-3. **Manual triggers**: CLI sends SIGUSR1 signal to daemon for `autogit now` command (triggers immediate check cycle)
+3. **Unix Domain Socket**: Daemon listens on `~/.config/autogit/daemon.sock` for CLI commands
+   - CLI sends JSON-encoded commands: `Trigger`, `Status`, `Ping`
+   - Daemon responds with JSON-encoded responses including detailed results
+   - Protocol defined in `autogit-shared/src/protocol.rs`
+   - Socket is automatically cleaned up on daemon shutdown
 4. **Desktop notifications**: Daemon sends notifications via `notify-rust` when git push/pull operations fail
+
+**Important**: systemd is only used to start/stop the daemon. All daemon interaction (status checks, manual triggers) works via the Unix socket, so the daemon can be run manually without systemd if needed.
 
 ### Daemon Event Loop
 
 The daemon uses `tokio::select!` to handle multiple concurrent events:
 - **Periodic timer**: Checks repositories at configured interval
-- **SIGUSR1**: Manual trigger from `autogit now` command
+- **Unix socket connections**: Accepts incoming CLI commands (Trigger, Status, Ping)
+  - Each connection is handled in a spawned tokio task
+  - Commands are parsed from JSON, executed, and responses sent back
 - **Config reload channel**: Triggered by file watcher when config changes
-- **SIGTERM/SIGINT**: Graceful shutdown
+- **SIGTERM/SIGINT**: Graceful shutdown (also cleans up socket file)
 
 ### Git Operations Strategy
 
@@ -104,9 +112,14 @@ Version is centralized in workspace `Cargo.toml` at `[workspace.package].version
 
 ## Key Implementation Details
 
-- **Signal handling**: Daemon must handle SIGUSR1 for manual triggers (not just SIGTERM/SIGINT)
+- **Socket communication**: Daemon communicates with CLI via Unix domain socket at `~/.config/autogit/daemon.sock`
+  - Protocol uses line-delimited JSON (one command/response per line)
+  - Enables bidirectional communication (daemon can return detailed results)
+  - Socket existence = daemon running (no stale file issues)
 - **SSH agent**: Service file uses `PassEnvironment=SSH_AUTH_SOCK` - users must run `systemctl --user import-environment SSH_AUTH_SOCK` after login
 - **Config path**: Always `~/.config/autogit/config.toml` (uses `dirs` crate)
-- **Async runtime**: Uses tokio for daemon, but git operations run in `tokio::task::spawn_blocking` since they're synchronous
+- **Socket path**: Always `~/.config/autogit/daemon.sock` (uses `dirs` crate)
+- **Async runtime**: Uses tokio for daemon (and CLI for socket ops), but git operations run in `tokio::task::spawn_blocking` since they're synchronous
 - **Desktop notifications**: Shows stderr output from failed git operations so users can see specific errors (SSH key issues, network problems, etc.)
+- **systemd optional**: systemd is only used for starting/stopping the daemon. All other operations work via socket, so daemon can run without systemd
 

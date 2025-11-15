@@ -14,6 +14,7 @@ autogit-shared = { path = "../autogit-shared" }
 
 # Core dependencies
 anyhow.workspace = true
+tokio = { workspace = true }
 
 # CLI
 clap.workspace = true

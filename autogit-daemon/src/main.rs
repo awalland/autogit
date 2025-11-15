@@ -1,10 +1,12 @@
 mod git;
+mod socket;
 
 use anyhow::{Context, Result};
 use autogit_shared::Config;
 use notify::{Watcher, RecursiveMode, Event};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, error, warn};
@@ -79,19 +81,27 @@ async fn main() -> Result<()> {
 
     info!("Watching config file for changes: {}", config_path.display());
 
+    // Set up Unix socket for CLI communication
+    let socket_listener = socket::create_listener()
+        .context("Failed to create Unix socket listener")?;
+
     // Set up signal handling for graceful shutdown
     let sigterm = signal(SignalKind::terminate())
         .context("Failed to create SIGTERM handler")?;
     let sigint = signal(SignalKind::interrupt())
         .context("Failed to create SIGINT handler")?;
-    let sigusr1 = signal(SignalKind::user_defined1())
-        .context("Failed to create SIGUSR1 handler")?;
+
+    // Track daemon start time for uptime reporting
+    let start_time = Instant::now();
 
     // Start the main daemon loop
-    run_daemon(config, config_path_clone, reload_rx, sigterm, sigint, sigusr1).await?;
+    run_daemon(config, config_path_clone, reload_rx, sigterm, sigint, socket_listener, start_time).await?;
 
     // Keep watcher alive until daemon exits
     drop(watcher);
+
+    // Clean up socket file
+    socket::cleanup_socket();
 
     info!("autogit-daemon shutting down");
     Ok(())
@@ -103,7 +113,8 @@ async fn run_daemon(
     mut reload_rx: mpsc::Receiver<()>,
     mut sigterm: tokio::signal::unix::Signal,
     mut sigint: tokio::signal::unix::Signal,
-    mut sigusr1: tokio::signal::unix::Signal,
+    socket_listener: tokio::net::UnixListener,
+    start_time: Instant,
 ) -> Result<()> {
     let mut interval = {
         let cfg = config.read().await;
@@ -129,29 +140,12 @@ async fn run_daemon(
                 break;
             }
 
-            _ = sigusr1.recv() => {
-                // Manual trigger via `autogit now`
-                info!("Received SIGUSR1, triggering immediate check and commit cycle");
-                let cfg = config.read().await;
-
-                // Process each repository
-                for repo in &cfg.repositories {
-                    if !repo.auto_commit {
-                        continue;
-                    }
-
-                    match git::check_and_commit(repo).await {
-                        Ok(committed) => {
-                            if committed {
-                                info!("Committed changes in: {}", repo.path.display());
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error processing repository {}: {:#}", repo.path.display(), e);
-                        }
-                    }
-                }
-                info!("Manual check and commit cycle complete");
+            // Handle incoming socket connections
+            Ok((stream, _addr)) = socket_listener.accept() => {
+                let config_clone = Arc::clone(&config);
+                tokio::spawn(async move {
+                    socket::handle_connection(stream, config_clone, start_time).await;
+                });
             }
 
             _ = interval.tick() => {

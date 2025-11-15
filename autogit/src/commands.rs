@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
-use autogit_shared::{Config, Repository};
+use autogit_shared::{Config, Repository, Command as DaemonCommand, Response, ResponseStatus, ResponseData, socket_path};
 use colored::Colorize;
 use std::path::PathBuf;
-use std::process::Command;
 use tabled::{Table, Tabled, settings::{Style, Width}};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// Add a repository to the configuration
 pub fn add_repository(path: &str, message: Option<String>, interval: Option<u64>) -> Result<()> {
@@ -182,16 +183,12 @@ pub fn set_interval(seconds: Option<u64>) -> Result<()> {
 }
 
 /// Show current configuration status
-pub fn show_status() -> Result<()> {
+pub async fn show_status() -> Result<()> {
     let config_path = Config::default_config_path()?;
     let config = Config::load_or_create_default()?;
 
-    // Check daemon status
-    let daemon_running = Command::new("systemctl")
-        .args(&["--user", "is-active", "autogit-daemon"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
+    // Check daemon status via socket
+    let daemon_running = is_daemon_running().await;
 
     println!("{}", "autogit Configuration".bold().underline());
 
@@ -246,47 +243,52 @@ pub fn edit_config() -> Result<()> {
 }
 
 /// Trigger an immediate check and commit cycle
-pub fn trigger_now() -> Result<()> {
-    // Check if daemon is running using systemctl
-    let status = Command::new("systemctl")
-        .args(&["--user", "is-active", "autogit-daemon"])
-        .output()
-        .context("Failed to check daemon status")?;
+pub async fn trigger_now() -> Result<()> {
+    println!("{} Triggering immediate check and commit cycle...", "→".blue());
 
-    if !status.status.success() {
-        bail!("autogit-daemon is not running. Start it with: systemctl --user start autogit-daemon");
+    // Send trigger command to daemon
+    let response = send_daemon_command(DaemonCommand::Trigger).await?;
+
+    // Check response status
+    if response.status != ResponseStatus::Ok {
+        bail!("Daemon returned error: {}", response.message);
     }
 
-    // Get the daemon PID using systemctl
-    let pid_output = Command::new("systemctl")
-        .args(&["--user", "show", "autogit-daemon", "--property=MainPID", "--value"])
-        .output()
-        .context("Failed to get daemon PID")?;
+    println!("{} {}", "✓".green().bold(), response.message);
 
-    let pid_str = String::from_utf8(pid_output.stdout)
-        .context("Invalid UTF-8 in PID output")?
-        .trim()
-        .to_owned();
+    // Display detailed results if available
+    if let Some(ResponseData::Trigger { repos_checked, repos_committed, details }) = response.data {
+        if !details.is_empty() {
+            println!("\n{}", "Results:".bold());
+            for detail in details {
+                let icon = if detail.committed {
+                    "✓".green()
+                } else if detail.error.is_some() {
+                    "✗".red()
+                } else {
+                    "−".yellow()
+                };
 
-    let pid: i32 = pid_str.parse()
-        .with_context(|| format!("Invalid PID: {}", pid_str))?;
+                print!("  {} {}", icon, detail.path.display());
 
-    if pid == 0 {
-        bail!("Failed to get daemon PID. Is the daemon running?");
+                if let Some(files) = detail.files_changed {
+                    if files > 0 {
+                        print!(" ({} files)", files);
+                    }
+                }
+
+                if let Some(ref error) = detail.error {
+                    print!(" - {}", error.red());
+                }
+
+                println!();
+            }
+        }
+
+        if repos_committed == 0 && repos_checked > 0 {
+            println!("\n{} No changes to commit in any repository", "→".blue());
+        }
     }
-
-    // Send SIGUSR1 to the daemon to trigger immediate check
-    let signal_result = Command::new("kill")
-        .args(&["-USR1", &pid.to_string()])
-        .status()
-        .context("Failed to send signal to daemon")?;
-
-    if !signal_result.success() {
-        bail!("Failed to signal daemon (PID: {})", pid);
-    }
-
-    println!("{} Triggered immediate check and commit cycle", "✓".green().bold());
-    println!("{} Check the daemon logs for results: journalctl --user -u autogit-daemon -f", "→".blue());
 
     Ok(())
 }
@@ -303,4 +305,51 @@ fn expand_path(path: &str) -> Result<PathBuf> {
 
     expanded.canonicalize()
         .with_context(|| format!("Failed to resolve path: {}", path))
+}
+
+/// Send a command to the daemon via Unix socket and get response
+async fn send_daemon_command(command: DaemonCommand) -> Result<Response> {
+    let socket_path = socket_path()
+        .context("Failed to get socket path")?;
+
+    // Try to connect to the socket
+    let stream = UnixStream::connect(&socket_path).await
+        .with_context(|| format!(
+            "Failed to connect to daemon socket: {}\nIs the daemon running? Start it with: systemctl --user start autogit-daemon",
+            socket_path.display()
+        ))?;
+
+    // Send command
+    let command_json = command.to_json()
+        .context("Failed to serialize command")?;
+
+    let mut stream = stream;
+    stream.write_all(command_json.as_bytes()).await
+        .context("Failed to send command to daemon")?;
+
+    stream.flush().await
+        .context("Failed to flush socket")?;
+
+    // Shutdown write side to signal we're done sending
+    stream.shutdown().await
+        .context("Failed to shutdown write side of socket")?;
+
+    // Read response
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+
+    reader.read_line(&mut line).await
+        .context("Failed to read response from daemon")?;
+
+    if line.is_empty() {
+        bail!("Daemon closed connection without sending response");
+    }
+
+    Response::from_json(&line)
+        .context("Failed to parse daemon response")
+}
+
+/// Check if daemon is running by trying to ping it
+async fn is_daemon_running() -> bool {
+    send_daemon_command(DaemonCommand::Ping).await.is_ok()
 }

@@ -5,7 +5,8 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -28,13 +29,13 @@ fn main() -> Result<()> {
             commands::set_interval(seconds)?;
         }
         Commands::Status => {
-            commands::show_status()?;
+            commands::show_status().await?;
         }
         Commands::Edit => {
             commands::edit_config()?;
         }
         Commands::Now => {
-            commands::trigger_now()?;
+            commands::trigger_now().await?;
         }
     }
 
