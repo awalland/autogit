@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("Starting autogit-daemon");
+    info!("Starting autogit-daemon v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
     let config_path = Config::default_config_path()
