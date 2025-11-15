@@ -83,6 +83,17 @@ path = "/home/user/journal"
 auto_commit = true
 commit_message_template = "Journal update: {date}"
 ```
+> **⚠️ IMPORTANT: SSH Agent Setup**
+>
+> If you use SSH for git operations, you need to ensure the daemon has access to your SSH agent:
+>
+> ```bash
+> systemctl --user import-environment SSH_AUTH_SOCK
+> ```
+>
+> This command must be run every time you log in. To make it automatic, add it to:
+> - Your shell profile (`~/.bash_profile`, `~/.zprofile`, `~/.bashrc`)
+> - Or your desktop environment startup configuration (e.g., i3 config, KDE or GNOME startup applications)
 
 ### Commit Message Templates
 
@@ -163,17 +174,6 @@ systemctl --user status autogit-daemon
 journalctl --user -u autogit-daemon -f
 ```
 
-> **⚠️ IMPORTANT: SSH Agent Setup**
->
-> If you use SSH for git operations, you need to ensure the daemon has access to your SSH agent:
->
-> ```bash
-> systemctl --user import-environment SSH_AUTH_SOCK
-> ```
->
-> This command must be run every time you log in. To make it automatic, add it to:
-> - Your shell profile (`~/.bash_profile`, `~/.zprofile`, `~/.bashrc`)
-> - Or your desktop environment startup configuration (e.g., i3 config, GNOME startup applications)
 
 ## Requirements
 
