@@ -384,7 +384,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_expand_path_absolute() {
-        let path = "/tmp/test";
+        let _path = "/tmp/test";
         // expand_path is private, but we can test it indirectly
         // Just documenting the behavior here
         assert!(true); // Placeholder
