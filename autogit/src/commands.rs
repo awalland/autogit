@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use autogit_shared::{Config, Repository};
 use colored::Colorize;
 use std::path::PathBuf;
+use std::process::Command;
 use tabled::{Table, Tabled, settings::{Style, Width}};
 
 /// Add a repository to the configuration
@@ -223,6 +224,52 @@ pub fn edit_config() -> Result<()> {
         .context("Failed to open editor")?;
 
     println!("{} Changes will be applied automatically (daemon auto-reloads config)", "→".green());
+
+    Ok(())
+}
+
+/// Trigger an immediate check and commit cycle
+pub fn trigger_now() -> Result<()> {
+    // Check if daemon is running using systemctl
+    let status = Command::new("systemctl")
+        .args(&["--user", "is-active", "autogit-daemon"])
+        .output()
+        .context("Failed to check daemon status")?;
+
+    if !status.status.success() {
+        bail!("autogit-daemon is not running. Start it with: systemctl --user start autogit-daemon");
+    }
+
+    // Get the daemon PID using systemctl
+    let pid_output = Command::new("systemctl")
+        .args(&["--user", "show", "autogit-daemon", "--property=MainPID", "--value"])
+        .output()
+        .context("Failed to get daemon PID")?;
+
+    let pid_str = String::from_utf8(pid_output.stdout)
+        .context("Invalid UTF-8 in PID output")?
+        .trim()
+        .to_string();
+
+    let pid: i32 = pid_str.parse()
+        .with_context(|| format!("Invalid PID: {}", pid_str))?;
+
+    if pid == 0 {
+        bail!("Failed to get daemon PID. Is the daemon running?");
+    }
+
+    // Send SIGUSR1 to the daemon to trigger immediate check
+    let signal_result = Command::new("kill")
+        .args(&["-USR1", &pid.to_string()])
+        .status()
+        .context("Failed to send signal to daemon")?;
+
+    if !signal_result.success() {
+        bail!("Failed to signal daemon (PID: {})", pid);
+    }
+
+    println!("{} Triggered immediate check and commit cycle", "✓".green().bold());
+    println!("{} Check the daemon logs for results: journalctl --user -u autogit-daemon -f", "→".blue());
 
     Ok(())
 }

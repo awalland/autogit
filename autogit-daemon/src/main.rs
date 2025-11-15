@@ -84,9 +84,11 @@ async fn main() -> Result<()> {
         .context("Failed to create SIGTERM handler")?;
     let sigint = signal(SignalKind::interrupt())
         .context("Failed to create SIGINT handler")?;
+    let sigusr1 = signal(SignalKind::user_defined1())
+        .context("Failed to create SIGUSR1 handler")?;
 
     // Start the main daemon loop
-    run_daemon(config, config_path_clone, reload_rx, sigterm, sigint).await?;
+    run_daemon(config, config_path_clone, reload_rx, sigterm, sigint, sigusr1).await?;
 
     // Keep watcher alive until daemon exits
     drop(watcher);
@@ -101,6 +103,7 @@ async fn run_daemon(
     mut reload_rx: mpsc::Receiver<()>,
     mut sigterm: tokio::signal::unix::Signal,
     mut sigint: tokio::signal::unix::Signal,
+    mut sigusr1: tokio::signal::unix::Signal,
 ) -> Result<()> {
     let mut interval = {
         let cfg = config.read().await;
@@ -124,6 +127,31 @@ async fn run_daemon(
             _ = sigint.recv() => {
                 info!("Received SIGINT (Ctrl+C), shutting down gracefully");
                 break;
+            }
+
+            _ = sigusr1.recv() => {
+                // Manual trigger via `autogit now`
+                info!("Received SIGUSR1, triggering immediate check and commit cycle");
+                let cfg = config.read().await;
+
+                // Process each repository
+                for repo in &cfg.repositories {
+                    if !repo.auto_commit {
+                        continue;
+                    }
+
+                    match git::check_and_commit(repo).await {
+                        Ok(committed) => {
+                            if committed {
+                                info!("Committed changes in: {}", repo.path.display());
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error processing repository {}: {:#}", repo.path.display(), e);
+                        }
+                    }
+                }
+                info!("Manual check and commit cycle complete");
             }
 
             _ = interval.tick() => {

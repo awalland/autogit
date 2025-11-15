@@ -60,6 +60,9 @@ enum Commands {
 
     /// Edit configuration file in $EDITOR
     Edit,
+
+    /// Trigger an immediate check and commit cycle
+    Now,
 }
 
 fn main() -> Result<()> {
@@ -89,6 +92,9 @@ fn main() -> Result<()> {
         }
         Commands::Edit => {
             commands::edit_config()?;
+        }
+        Commands::Now => {
+            commands::trigger_now()?;
         }
     }
 
