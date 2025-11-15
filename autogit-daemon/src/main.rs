@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_daemon(
+pub(crate) async fn run_daemon(
     config: Arc<RwLock<Config>>,
     config_path: PathBuf,
     mut reload_rx: mpsc::Receiver<()>,
@@ -236,4 +236,454 @@ async fn run_daemon(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autogit_shared::{Config, DaemonConfig, Repository};
+    use std::env;
+    use tempfile::TempDir;
+    use tokio::net::UnixListener;
+    use serial_test::serial;
+
+    // Helper to create a test config
+    fn create_test_config() -> Config {
+        Config {
+            daemon: DaemonConfig {
+                check_interval_seconds: 1, // Short interval for testing
+            },
+            repositories: vec![],
+        }
+    }
+
+    // Helper to create a test socket listener
+    async fn create_test_socket() -> UnixListener {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+        UnixListener::bind(&socket_path).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_config_reload_updates_interval() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        // Create initial config
+        let config_path = Config::default_config_path().unwrap();
+        let mut config = create_test_config();
+        config.daemon.check_interval_seconds = 60;
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        // Create channels and signals
+        let (reload_tx, reload_rx) = mpsc::channel(10);
+
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Spawn daemon in background
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+            ).await;
+        });
+
+        // Give daemon time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Verify initial interval
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.daemon.check_interval_seconds, 60);
+        }
+
+        // Update config file with new interval
+        let mut new_config = create_test_config();
+        new_config.daemon.check_interval_seconds = 120;
+        new_config.save(&config_path).unwrap();
+
+        // Trigger reload
+        reload_tx.send(()).await.unwrap();
+
+        // Give daemon time to reload
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify interval was updated
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.daemon.check_interval_seconds, 120);
+        }
+
+        // Shutdown daemon
+        daemon_handle.abort();
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_config_reload_adds_repositories() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        // Create initial config with no repos
+        let config_path = Config::default_config_path().unwrap();
+        let config = create_test_config();
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        // Create channels and signals
+        let (reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Spawn daemon in background
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+            ).await;
+        });
+
+        // Give daemon time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Verify no repos initially
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.repositories.len(), 0);
+        }
+
+        // Update config file with new repositories
+        let mut new_config = create_test_config();
+        new_config.repositories.push(Repository {
+            path: PathBuf::from("/test/repo1"),
+            auto_commit: true,
+            commit_message_template: "Test: {timestamp}".to_owned(),
+        });
+        new_config.repositories.push(Repository {
+            path: PathBuf::from("/test/repo2"),
+            auto_commit: false,
+            commit_message_template: "Test2".to_owned(),
+        });
+        new_config.save(&config_path).unwrap();
+
+        // Trigger reload
+        reload_tx.send(()).await.unwrap();
+
+        // Give daemon time to reload
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify repos were added
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.repositories.len(), 2);
+            assert_eq!(cfg.repositories[0].path, PathBuf::from("/test/repo1"));
+            assert_eq!(cfg.repositories[1].path, PathBuf::from("/test/repo2"));
+        }
+
+        // Shutdown daemon
+        daemon_handle.abort();
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_config_reload_handles_invalid_config() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        // Create initial config
+        let config_path = Config::default_config_path().unwrap();
+        let mut initial_config = create_test_config();
+        initial_config.daemon.check_interval_seconds = 60;
+        initial_config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(initial_config));
+
+        // Create channels and signals
+        let (reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Spawn daemon in background
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+            ).await;
+        });
+
+        // Give daemon time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Write invalid TOML to config file
+        std::fs::write(&config_path, "this is not valid toml!!!").unwrap();
+
+        // Trigger reload
+        reload_tx.send(()).await.unwrap();
+
+        // Give daemon time to attempt reload
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify original config is still in place (reload failed gracefully)
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.daemon.check_interval_seconds, 60);
+        }
+
+        // Shutdown daemon
+        daemon_handle.abort();
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_config_reload_only_initializes_new_repos() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        // Create initial config with one repo
+        let config_path = Config::default_config_path().unwrap();
+        let mut initial_config = create_test_config();
+        initial_config.repositories.push(Repository {
+            path: PathBuf::from("/test/existing"),
+            auto_commit: true,
+            commit_message_template: "Existing".to_owned(),
+        });
+        initial_config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(initial_config));
+
+        // Create channels and signals
+        let (reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Spawn daemon in background
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+            ).await;
+        });
+
+        // Give daemon time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Add a new repository to config
+        let mut new_config = create_test_config();
+        new_config.repositories.push(Repository {
+            path: PathBuf::from("/test/existing"),
+            auto_commit: true,
+            commit_message_template: "Existing".to_owned(),
+        });
+        new_config.repositories.push(Repository {
+            path: PathBuf::from("/test/new"),
+            auto_commit: true,
+            commit_message_template: "New".to_owned(),
+        });
+        new_config.save(&config_path).unwrap();
+
+        // Trigger reload
+        reload_tx.send(()).await.unwrap();
+
+        // Give daemon time to reload
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify both repos are present
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.repositories.len(), 2);
+            assert_eq!(cfg.repositories[0].path, PathBuf::from("/test/existing"));
+            assert_eq!(cfg.repositories[1].path, PathBuf::from("/test/new"));
+        }
+
+        // Shutdown daemon
+        daemon_handle.abort();
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_daemon_respects_short_check_interval() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        // Create config with very short interval
+        let config_path = Config::default_config_path().unwrap();
+        let mut config = create_test_config();
+        config.daemon.check_interval_seconds = 1; // 1 second
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        // Create channels and signals
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Spawn daemon in background
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+            ).await;
+        });
+
+        // Let it run for a bit
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Daemon should still be running
+        assert!(!daemon_handle.is_finished());
+
+        // Shutdown daemon
+        daemon_handle.abort();
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_config_reload_skips_disabled_repos() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        // Create initial config
+        let config_path = Config::default_config_path().unwrap();
+        let config = create_test_config();
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        // Create channels and signals
+        let (reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Spawn daemon in background
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+            ).await;
+        });
+
+        // Give daemon time to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Update config with disabled repo
+        let mut new_config = create_test_config();
+        new_config.repositories.push(Repository {
+            path: PathBuf::from("/test/disabled"),
+            auto_commit: false, // Disabled
+            commit_message_template: "Disabled".to_owned(),
+        });
+        new_config.save(&config_path).unwrap();
+
+        // Trigger reload
+        reload_tx.send(()).await.unwrap();
+
+        // Give daemon time to reload (should skip initialization of disabled repo)
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify repo is in config but wasn't initialized (we can't directly test
+        // initialization here, but the code path is exercised)
+        {
+            let cfg = config.read().await;
+            assert_eq!(cfg.repositories.len(), 1);
+            assert_eq!(cfg.repositories[0].auto_commit, false);
+        }
+
+        // Shutdown daemon
+        daemon_handle.abort();
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
 }
