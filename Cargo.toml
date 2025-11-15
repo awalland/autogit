@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "autogit-daemon",
+    "autogit",
+    "autogit-shared",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Armin Walland <armin@wal.land>"]
+license = "WTFPL"
+
+[workspace.dependencies]
+# Shared dependencies
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Git operations
+git2 = "0.19"
+
+# File watching
+notify = "6.1"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+dialoguer = "0.11"
+
+# Async runtime (if needed later)
+tokio = { version = "1.40", features = ["full"] }

@@ -1,0 +1,21 @@
+[Unit]
+Description=Automatic Git Commit Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/autogit-daemon
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Optional: Set log level (options: trace, debug, info, warn, error)
+Environment="RUST_LOG=info"
+# Inherit SSH agent socket from user session
+PassEnvironment=SSH_AUTH_SOCK
+
+[Install]
+WantedBy=default.target

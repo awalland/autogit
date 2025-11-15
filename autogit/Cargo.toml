@@ -1,0 +1,26 @@
+[package]
+name = "autogit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autogit"
+path = "src/main.rs"
+
+[dependencies]
+autogit-shared = { path = "../autogit-shared" }
+
+# Core dependencies
+anyhow.workspace = true
+
+# CLI
+clap.workspace = true
+dialoguer.workspace = true
+
+# For colored output
+colored = "2.1"
+
+# Table formatting
+tabled = "0.15"
