@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+
+## Code Style Conventions
+
+- **String conversions**: Use `.to_owned()` instead of `.to_string()` when converting `&str` or string slices to `String`. Reserve `.to_string()` for types that implement `Display` trait (like integers, floats, `Path::display()`, format results, etc.)
+
 ## Project Overview
 
 `autogit` is an automatic git commit daemon with CLI configuration tool. It consists of three Rust workspace crates:
@@ -105,6 +110,3 @@ Version is centralized in workspace `Cargo.toml` at `[workspace.package].version
 - **Async runtime**: Uses tokio for daemon, but git operations run in `tokio::task::spawn_blocking` since they're synchronous
 - **Desktop notifications**: Shows stderr output from failed git operations so users can see specific errors (SSH key issues, network problems, etc.)
 
-## Code Style Conventions
-
-- **String conversions**: Use `.to_owned()` instead of `.to_string()` when converting `&str` or string slices to `String`. Reserve `.to_string()` for types that implement `Display` trait (like integers, floats, `Path::display()`, format results, etc.)
