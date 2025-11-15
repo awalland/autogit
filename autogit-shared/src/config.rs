@@ -141,4 +141,153 @@ mod tests {
         assert_eq!(deserialized.daemon.check_interval_seconds, 60);
         assert_eq!(deserialized.repositories.len(), 1);
     }
+
+    #[test]
+    fn test_config_defaults() {
+        let config = Config::default();
+
+        // Default daemon config
+        assert_eq!(config.daemon.check_interval_seconds, 300); // 5 minutes
+
+        // No repositories by default
+        assert_eq!(config.repositories.len(), 0);
+    }
+
+    #[test]
+    fn test_daemon_config_defaults() {
+        let daemon_config = DaemonConfig::default();
+        assert_eq!(daemon_config.check_interval_seconds, 300);
+    }
+
+    #[test]
+    fn test_repository_with_defaults() {
+        // Test that serde defaults work when fields are missing
+        let toml_str = r#"
+            path = "/home/user/repo"
+        "#;
+
+        let repo: Repository = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(repo.path, PathBuf::from("/home/user/repo"));
+        assert_eq!(repo.auto_commit, true); // default_true
+        assert_eq!(repo.commit_message_template, "Auto-commit: {timestamp}"); // default_commit_message
+    }
+
+    #[test]
+    fn test_config_with_partial_daemon_section() {
+        // Test that daemon defaults work when section is missing
+        let toml_str = r#"
+            [[repositories]]
+            path = "/home/user/notes"
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.daemon.check_interval_seconds, 300); // Uses default
+        assert_eq!(config.repositories.len(), 1);
+    }
+
+    #[test]
+    fn test_config_with_multiple_repositories() {
+        let config = Config {
+            daemon: DaemonConfig {
+                check_interval_seconds: 120,
+            },
+            repositories: vec![
+                Repository {
+                    path: PathBuf::from("/home/user/notes"),
+                    auto_commit: true,
+                    commit_message_template: "Notes: {date}".to_owned(),
+                },
+                Repository {
+                    path: PathBuf::from("/home/user/journal"),
+                    auto_commit: false,
+                    commit_message_template: "Journal: {time}".to_owned(),
+                },
+                Repository {
+                    path: PathBuf::from("/home/user/code"),
+                    auto_commit: true,
+                    commit_message_template: "Code changes".to_owned(),
+                },
+            ],
+        };
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(deserialized.repositories.len(), 3);
+        assert_eq!(deserialized.repositories[0].auto_commit, true);
+        assert_eq!(deserialized.repositories[1].auto_commit, false);
+        assert_eq!(deserialized.repositories[2].commit_message_template, "Code changes");
+    }
+
+    #[test]
+    fn test_config_empty_repositories() {
+        let config = Config {
+            daemon: DaemonConfig {
+                check_interval_seconds: 60,
+            },
+            repositories: vec![],
+        };
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(deserialized.repositories.len(), 0);
+    }
+
+    #[test]
+    fn test_repository_disabled_auto_commit() {
+        let toml_str = r#"
+            path = "/home/user/repo"
+            auto_commit = false
+            commit_message_template = "Custom message"
+        "#;
+
+        let repo: Repository = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(repo.auto_commit, false);
+        assert_eq!(repo.commit_message_template, "Custom message");
+    }
+
+    #[test]
+    fn test_config_various_intervals() {
+        for interval in [1, 60, 300, 3600, 86400] {
+            let config = Config {
+                daemon: DaemonConfig {
+                    check_interval_seconds: interval,
+                },
+                repositories: vec![],
+            };
+
+            let toml_str = toml::to_string_pretty(&config).unwrap();
+            let deserialized: Config = toml::from_str(&toml_str).unwrap();
+
+            assert_eq!(deserialized.daemon.check_interval_seconds, interval);
+        }
+    }
+
+    #[test]
+    fn test_repository_custom_message_templates() {
+        let templates = vec![
+            "Auto-commit: {timestamp}",
+            "Changes at {date} {time}",
+            "Update {date}",
+            "Checkpoint",
+            "Work in progress: {timestamp}",
+        ];
+
+        for template in templates {
+            let repo = Repository {
+                path: PathBuf::from("/test"),
+                auto_commit: true,
+                commit_message_template: template.to_owned(),
+            };
+
+            let toml_str = toml::to_string(&repo).unwrap();
+            let deserialized: Repository = toml::from_str(&toml_str).unwrap();
+
+            assert_eq!(deserialized.commit_message_template, template);
+        }
+    }
 }

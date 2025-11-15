@@ -147,6 +147,57 @@ mod tests {
     }
 
     #[test]
+    fn test_command_trigger() {
+        let cmd = Command::Trigger;
+        let json = cmd.to_json().unwrap();
+        assert!(json.contains("\"command\":\"trigger\""));
+        assert!(json.ends_with('\n'));
+
+        let parsed = Command::from_json(&json).unwrap();
+        matches!(parsed, Command::Trigger);
+    }
+
+    #[test]
+    fn test_command_status() {
+        let cmd = Command::Status;
+        let json = cmd.to_json().unwrap();
+        assert!(json.contains("\"command\":\"status\""));
+
+        let parsed = Command::from_json(&json).unwrap();
+        matches!(parsed, Command::Status);
+    }
+
+    #[test]
+    fn test_command_ping() {
+        let cmd = Command::Ping;
+        let json = cmd.to_json().unwrap();
+        assert!(json.contains("\"command\":\"ping\""));
+
+        let parsed = Command::from_json(&json).unwrap();
+        matches!(parsed, Command::Ping);
+    }
+
+    #[test]
+    fn test_command_with_whitespace() {
+        let json = "  {\"command\":\"trigger\"}  \n";
+        let parsed = Command::from_json(json).unwrap();
+        matches!(parsed, Command::Trigger);
+    }
+
+    #[test]
+    fn test_command_invalid_json() {
+        let result = Command::from_json("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_command_unknown_command() {
+        let json = "{\"command\":\"unknown\"}";
+        let result = Command::from_json(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_response_serialization() {
         let resp = Response::ok("Test message");
         let json = resp.to_json().unwrap();
@@ -155,6 +206,33 @@ mod tests {
         assert_eq!(parsed.status, ResponseStatus::Ok);
         assert_eq!(parsed.message, "Test message");
         assert!(parsed.data.is_none());
+    }
+
+    #[test]
+    fn test_response_ok() {
+        let resp = Response::ok("Success");
+        assert_eq!(resp.status, ResponseStatus::Ok);
+        assert_eq!(resp.message, "Success");
+        assert!(resp.data.is_none());
+    }
+
+    #[test]
+    fn test_response_error() {
+        let resp = Response::error("Something failed");
+        assert_eq!(resp.status, ResponseStatus::Error);
+        assert_eq!(resp.message, "Something failed");
+        assert!(resp.data.is_none());
+    }
+
+    #[test]
+    fn test_response_status_serialization() {
+        let ok = ResponseStatus::Ok;
+        let ok_json = serde_json::to_string(&ok).unwrap();
+        assert_eq!(ok_json, "\"ok\"");
+
+        let error = ResponseStatus::Error;
+        let error_json = serde_json::to_string(&error).unwrap();
+        assert_eq!(error_json, "\"error\"");
     }
 
     #[test]
@@ -186,5 +264,207 @@ mod tests {
 
         assert_eq!(parsed.status, ResponseStatus::Ok);
         assert!(parsed.data.is_some());
+    }
+
+    #[test]
+    fn test_response_trigger_data() {
+        let data = ResponseData::Trigger {
+            repos_checked: 3,
+            repos_committed: 2,
+            details: vec![
+                RepoDetail {
+                    path: PathBuf::from("/repo1"),
+                    committed: true,
+                    files_changed: Some(10),
+                    error: None,
+                },
+                RepoDetail {
+                    path: PathBuf::from("/repo2"),
+                    committed: true,
+                    files_changed: Some(5),
+                    error: None,
+                },
+                RepoDetail {
+                    path: PathBuf::from("/repo3"),
+                    committed: false,
+                    files_changed: None,
+                    error: None,
+                },
+            ],
+        };
+
+        let resp = Response::ok_with_data("Done", data);
+        let json = resp.to_json().unwrap();
+        let parsed = Response::from_json(&json).unwrap();
+
+        assert_eq!(parsed.status, ResponseStatus::Ok);
+        if let Some(ResponseData::Trigger { repos_checked, repos_committed, details }) = parsed.data {
+            assert_eq!(repos_checked, 3);
+            assert_eq!(repos_committed, 2);
+            assert_eq!(details.len(), 3);
+            assert_eq!(details[0].committed, true);
+            assert_eq!(details[0].files_changed, Some(10));
+            assert_eq!(details[2].committed, false);
+        } else {
+            panic!("Expected Trigger data");
+        }
+    }
+
+    #[test]
+    fn test_response_status_data() {
+        let data = ResponseData::Status {
+            uptime_seconds: 3600,
+            check_interval_seconds: 300,
+            repositories_count: 5,
+        };
+
+        let resp = Response::ok_with_data("Status", data);
+        let json = resp.to_json().unwrap();
+        let parsed = Response::from_json(&json).unwrap();
+
+        if let Some(ResponseData::Status { uptime_seconds, check_interval_seconds, repositories_count }) = parsed.data {
+            assert_eq!(uptime_seconds, 3600);
+            assert_eq!(check_interval_seconds, 300);
+            assert_eq!(repositories_count, 5);
+        } else {
+            panic!("Expected Status data");
+        }
+    }
+
+    #[test]
+    fn test_repo_detail_with_error() {
+        let detail = RepoDetail {
+            path: PathBuf::from("/failed/repo"),
+            committed: false,
+            files_changed: None,
+            error: Some("Authentication failed".to_owned()),
+        };
+
+        let json = serde_json::to_string(&detail).unwrap();
+        let parsed: RepoDetail = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.committed, false);
+        assert!(parsed.error.is_some());
+        assert_eq!(parsed.error.unwrap(), "Authentication failed");
+    }
+
+    #[test]
+    fn test_repo_detail_successful() {
+        let detail = RepoDetail {
+            path: PathBuf::from("/success/repo"),
+            committed: true,
+            files_changed: Some(3),
+            error: None,
+        };
+
+        let json = serde_json::to_string(&detail).unwrap();
+        let parsed: RepoDetail = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.committed, true);
+        assert_eq!(parsed.files_changed, Some(3));
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn test_repo_detail_no_changes() {
+        let detail = RepoDetail {
+            path: PathBuf::from("/nochanges/repo"),
+            committed: false,
+            files_changed: None,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&detail).unwrap();
+        let parsed: RepoDetail = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.committed, false);
+        assert!(parsed.files_changed.is_none());
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn test_response_roundtrip() {
+        let responses = vec![
+            Response::ok("Success"),
+            Response::error("Failed"),
+            Response::ok_with_data(
+                "Triggered",
+                ResponseData::Trigger {
+                    repos_checked: 0,
+                    repos_committed: 0,
+                    details: vec![],
+                },
+            ),
+            Response::ok_with_data(
+                "Status",
+                ResponseData::Status {
+                    uptime_seconds: 0,
+                    check_interval_seconds: 60,
+                    repositories_count: 0,
+                },
+            ),
+        ];
+
+        for original in responses {
+            let json = original.to_json().unwrap();
+            let parsed = Response::from_json(&json).unwrap();
+
+            assert_eq!(parsed.status, original.status);
+            assert_eq!(parsed.message, original.message);
+        }
+    }
+
+    #[test]
+    fn test_response_with_empty_details() {
+        let data = ResponseData::Trigger {
+            repos_checked: 0,
+            repos_committed: 0,
+            details: vec![],
+        };
+
+        let resp = Response::ok_with_data("No repos", data);
+        let json = resp.to_json().unwrap();
+        let parsed = Response::from_json(&json).unwrap();
+
+        if let Some(ResponseData::Trigger { details, .. }) = parsed.data {
+            assert_eq!(details.len(), 0);
+        } else {
+            panic!("Expected Trigger data");
+        }
+    }
+
+    #[test]
+    fn test_response_invalid_json() {
+        let result = Response::from_json("invalid json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_response_with_newline() {
+        let resp = Response::ok("Test");
+        let json = resp.to_json().unwrap();
+        assert!(json.ends_with('\n'));
+
+        // Should still parse with newline
+        let parsed = Response::from_json(&json).unwrap();
+        assert_eq!(parsed.message, "Test");
+    }
+
+    #[test]
+    fn test_command_all_variants() {
+        let commands = vec![
+            Command::Trigger,
+            Command::Status,
+            Command::Ping,
+        ];
+
+        for cmd in commands {
+            let json = cmd.to_json().unwrap();
+            let parsed = Command::from_json(&json).unwrap();
+
+            // Verify round-trip works
+            let json2 = parsed.to_json().unwrap();
+            assert_eq!(json, json2);
+        }
     }
 }
