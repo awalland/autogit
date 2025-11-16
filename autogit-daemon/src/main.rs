@@ -111,6 +111,11 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Track tray initialization retry attempts
+    let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(
+        if enable_tray && initial_tray.is_none() { 0 } else { 3 }
+    ));
+
     let tray_handle = Arc::new(RwLock::new(initial_tray));
 
     // Set up signal handling for graceful shutdown
@@ -135,6 +140,7 @@ async fn main() -> Result<()> {
         tray_action_rx,
         suspended,
         tray_action_tx,
+        tray_retry_count,
     ).await?;
 
     // Keep watcher alive until daemon exits
@@ -159,6 +165,7 @@ pub(crate) async fn run_daemon(
     mut tray_action_rx: mpsc::Receiver<tray::TrayAction>,
     suspended: Arc<std::sync::atomic::AtomicBool>,
     tray_action_tx: mpsc::Sender<tray::TrayAction>,
+    tray_retry_count: Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let mut interval = {
         let cfg = config.read().await;
@@ -194,6 +201,34 @@ pub(crate) async fn run_daemon(
             }
 
             _ = interval.tick() => {
+                // Attempt to retry tray initialization if it failed initially
+                let enable_tray = config.read().await.daemon.enable_tray;
+                let current_retries = tray_retry_count.load(std::sync::atomic::Ordering::Relaxed);
+
+                if enable_tray && tray_handle.read().await.is_none() && current_retries < 3 {
+                    let new_count = current_retries + 1;
+                    info!("Retrying system tray initialization (attempt {}/3)", new_count);
+
+                    let repo_count = config.read().await.repositories.len();
+                    let new_tray = tray::AutogitTray::new(repo_count, tray_action_tx.clone(), suspended.clone());
+
+                    match new_tray.spawn_tray().await {
+                        Ok(handle) => {
+                            info!("System tray icon spawned successfully on retry");
+                            *tray_handle.write().await = Some(handle);
+                            tray_retry_count.store(3, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            warn!("Tray initialization retry {}/3 failed: {:#}", new_count, e);
+                            tray_retry_count.store(new_count, std::sync::atomic::Ordering::Relaxed);
+
+                            if new_count >= 3 {
+                                warn!("All tray initialization attempts exhausted, giving up");
+                            }
+                        }
+                    }
+                }
+
                 // Skip if daemon is suspended
                 if suspended.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
@@ -316,16 +351,19 @@ pub(crate) async fn run_daemon(
                                     Ok(handle) => {
                                         info!("System tray icon spawned successfully");
                                         *tray_handle.write().await = Some(handle);
+                                        tray_retry_count.store(3, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     Err(e) => {
                                         warn!("Failed to spawn system tray icon: {:#}", e);
-                                        warn!("Tray will remain disabled");
+                                        warn!("Will retry up to 3 times on next interval ticks");
+                                        tray_retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
                             } else {
                                 // Tray was enabled, now disable it
                                 info!("System tray disabled in configuration, removing tray icon");
                                 *tray_handle.write().await = None;
+                                tray_retry_count.store(3, std::sync::atomic::Ordering::Relaxed);
                                 info!("System tray icon removed");
                             }
                         }
@@ -475,6 +513,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
@@ -490,6 +529,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -556,6 +596,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
@@ -571,6 +612,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -649,6 +691,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
@@ -664,6 +707,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -727,6 +771,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
@@ -742,6 +787,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -814,6 +860,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
@@ -829,6 +876,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -875,6 +923,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
@@ -890,6 +939,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -953,6 +1003,7 @@ mod tests {
         let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tray_action_tx_clone = tray_action_tx.clone();
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -967,6 +1018,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx_clone,
+                tray_retry_count,
             ).await;
         });
 
@@ -1013,6 +1065,7 @@ mod tests {
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let suspended_clone = Arc::clone(&suspended);
         let tray_action_tx_clone = tray_action_tx.clone();
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -1027,6 +1080,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx_clone,
+                tray_retry_count,
             ).await;
         });
 
@@ -1074,6 +1128,7 @@ mod tests {
         let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tray_action_tx_clone = tray_action_tx.clone();
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
             run_daemon(
@@ -1088,6 +1143,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx_clone,
+                tray_retry_count,
             ).await
         });
 
@@ -1132,6 +1188,7 @@ mod tests {
         let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true)); // Start suspended
         let tray_action_tx_clone = tray_action_tx.clone();
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -1146,6 +1203,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx_clone,
+                tray_retry_count,
             ).await;
         });
 
@@ -1191,6 +1249,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true)); // Suspended
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -1205,6 +1264,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
@@ -1246,6 +1306,7 @@ mod tests {
         let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
         let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -1260,6 +1321,7 @@ mod tests {
                 tray_action_rx,
                 suspended,
                 tray_action_tx,
+                tray_retry_count,
             ).await;
         });
 
