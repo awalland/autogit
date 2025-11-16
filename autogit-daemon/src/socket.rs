@@ -525,4 +525,84 @@ mod tests {
         assert!(response.message.contains("repositories"));
         assert!(response.message.contains("committed changes in"));
     }
+
+    #[tokio::test]
+    async fn test_handle_suspend_command() {
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Initially not suspended
+        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Suspend the daemon
+        let response = handle_suspend_command(suspended.clone()).await;
+        assert_eq!(response.status, ResponseStatus::Ok);
+        assert_eq!(response.message, "Daemon suspended");
+
+        // Verify it's now suspended
+        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_handle_resume_command() {
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        // Initially suspended
+        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Resume the daemon
+        let response = handle_resume_command(suspended.clone()).await;
+        assert_eq!(response.status, ResponseStatus::Ok);
+        assert_eq!(response.message, "Daemon resumed");
+
+        // Verify it's no longer suspended
+        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_suspend_already_suspended() {
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        // Already suspended
+        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Suspend again (should be idempotent)
+        let response = handle_suspend_command(suspended.clone()).await;
+        assert_eq!(response.status, ResponseStatus::Ok);
+
+        // Still suspended
+        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_resume_already_running() {
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Already running (not suspended)
+        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Resume again (should be idempotent)
+        let response = handle_resume_command(suspended.clone()).await;
+        assert_eq!(response.status, ResponseStatus::Ok);
+
+        // Still running
+        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_status_command_when_suspended() {
+        let config = Arc::new(RwLock::new(create_test_config()));
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let response = handle_status_command(config, Instant::now(), suspended).await;
+        assert_eq!(response.status, ResponseStatus::Ok);
+        assert_eq!(response.message, "Daemon status (suspended)");
+
+        // Check that response includes status data
+        if let Some(ResponseData::Status { uptime_seconds: _, check_interval_seconds, repositories_count }) = response.data {
+            assert_eq!(check_interval_seconds, 300); // From create_test_config()
+            assert_eq!(repositories_count, 0); // No repos in test config
+        } else {
+            panic!("Expected Status response data");
+        }
+    }
 }

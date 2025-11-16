@@ -759,4 +759,321 @@ mod tests {
 
         drop(config_dir);
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_is_daemon_running_no_socket() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should return false when socket doesn't exist
+        let running = is_daemon_running().await;
+        assert!(!running);
+
+        drop(config_dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_send_daemon_command_no_daemon() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should fail when daemon is not running
+        let result = send_daemon_command(DaemonCommand::Ping).await;
+        assert!(result.is_err());
+
+        drop(config_dir);
+    }
+
+
+    #[test]
+    #[serial]
+    fn test_list_repositories_formatting() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let path = repo_dir.path().to_str().unwrap();
+
+        add_repository(path, Some("Test message".to_owned()), None).unwrap();
+
+        // List should succeed (even though we can't easily test the output format)
+        let result = list_repositories();
+        assert!(result.is_ok());
+
+        drop(config_dir);
+        drop(repo_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_repository_cleans_up_empty_config() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let path = repo_dir.path().to_str().unwrap();
+
+        add_repository(path, None, None).unwrap();
+
+        // Remove it
+        remove_repository(path).unwrap();
+
+        // Config should have no repositories
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 0);
+
+        drop(config_dir);
+        drop(repo_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_enable_already_enabled_repository() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let path = repo_dir.path().to_str().unwrap();
+
+        add_repository(path, None, None).unwrap();
+
+        // Enable it (should already be enabled)
+        let result = enable_repository(path);
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert!(config.repositories[0].auto_commit);
+
+        drop(config_dir);
+        drop(repo_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable_already_disabled_repository() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let path = repo_dir.path().to_str().unwrap();
+
+        add_repository(path, None, None).unwrap();
+
+        // Disable it
+        disable_repository(path).unwrap();
+
+        // Disable it again (should be idempotent)
+        let result = disable_repository(path);
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert!(!config.repositories[0].auto_commit);
+
+        drop(config_dir);
+        drop(repo_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_disable_repository_not_found() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        let result = disable_repository("/nonexistent/path");
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("Repository not found") || err.contains("Failed to resolve path"));
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_interval_zero() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should allow setting interval to 0 (though not recommended)
+        let result = set_interval(Some(0));
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.daemon.check_interval_seconds, 0);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_interval_large_value() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should allow large intervals
+        let result = set_interval(Some(86400)); // 24 hours
+        assert!(result.is_ok());
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.daemon.check_interval_seconds, 86400);
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_preserves_other_repos() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Create two test git repos
+        let repo1 = create_temp_git_repo().unwrap();
+        let repo2 = create_temp_git_repo().unwrap();
+
+        let path1 = repo1.path().to_str().unwrap();
+        let path2 = repo2.path().to_str().unwrap();
+
+        // Add first repo
+        add_repository(path1, Some("Message 1".to_owned()), None).unwrap();
+
+        // Add second repo
+        add_repository(path2, Some("Message 2".to_owned()), None).unwrap();
+
+        // Verify both exist
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 2);
+        assert_eq!(config.repositories[0].commit_message_template, "Message 1");
+        assert_eq!(config.repositories[1].commit_message_template, "Message 2");
+
+        drop(config_dir);
+        drop(repo1);
+        drop(repo2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_repository_preserves_others() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Create three test git repos
+        let repo1 = create_temp_git_repo().unwrap();
+        let repo2 = create_temp_git_repo().unwrap();
+        let repo3 = create_temp_git_repo().unwrap();
+
+        let path1 = repo1.path().to_str().unwrap();
+        let path2 = repo2.path().to_str().unwrap();
+        let path3 = repo3.path().to_str().unwrap();
+
+        // Add all three
+        add_repository(path1, Some("Msg1".to_owned()), None).unwrap();
+        add_repository(path2, Some("Msg2".to_owned()), None).unwrap();
+        add_repository(path3, Some("Msg3".to_owned()), None).unwrap();
+
+        // Remove middle one
+        remove_repository(path2).unwrap();
+
+        // Verify only first and third remain
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories.len(), 2);
+        assert_eq!(config.repositories[0].commit_message_template, "Msg1");
+        assert_eq!(config.repositories[1].commit_message_template, "Msg3");
+
+        drop(config_dir);
+        drop(repo1);
+        drop(repo2);
+        drop(repo3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_repository_default_message_template() {
+        let (config_dir, repo_dir) = setup_test_env().unwrap();
+        let path = repo_dir.path().to_str().unwrap();
+
+        // Add without specifying message template
+        add_repository(path, None, None).unwrap();
+
+        let config = Config::load_or_create_default().unwrap();
+        assert_eq!(config.repositories[0].commit_message_template, "Auto-commit: {timestamp}");
+
+        drop(config_dir);
+        drop(repo_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_repository_status_not_found() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Try to update non-existent repository
+        let result = enable_repository("/nonexistent");
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("Repository not found") || err.contains("Failed to resolve path"));
+
+        drop(config_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_edit_config_creates_config() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        env::set_var("EDITOR", "true"); // Use 'true' command which just exits successfully
+
+        // Should create config if it doesn't exist
+        let result = edit_config();
+        assert!(result.is_ok());
+
+        // Verify config was created
+        let config_path = Config::default_config_path().unwrap();
+        assert!(config_path.exists());
+
+        drop(config_dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_show_status_no_daemon() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should handle daemon not running gracefully
+        let result = show_status().await;
+        // It's okay if this fails since daemon is not running
+        // Just testing that it doesn't panic
+        let _ = result;
+
+        drop(config_dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_trigger_now_no_daemon() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should fail when daemon is not running
+        let result = trigger_now().await;
+        assert!(result.is_err());
+
+        drop(config_dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_suspend_daemon_no_daemon() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should fail when daemon is not running
+        let result = suspend_daemon().await;
+        assert!(result.is_err());
+
+        drop(config_dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resume_daemon_no_daemon() {
+        let config_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+
+        // Should fail when daemon is not running
+        let result = resume_daemon().await;
+        assert!(result.is_err());
+
+        drop(config_dir);
+    }
 }
