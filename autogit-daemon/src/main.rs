@@ -1346,4 +1346,74 @@ mod tests {
         daemon_handle.abort();
         let _ = std::fs::remove_file(&config_path);
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tray_retry_logic() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let mut config = create_test_config();
+        config.daemon.enable_tray = true;
+        config.daemon.check_interval_seconds = 1; // Short interval for testing
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        // Simulate tray initialization failure by starting with None
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+        // Start with retry count at 0 to simulate initial failure
+        let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let tray_retry_count_clone = Arc::clone(&tray_retry_count);
+
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
+                tray_retry_count,
+            ).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Initial retry count should be 0
+        assert_eq!(tray_retry_count_clone.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Wait for at least one interval tick (retry attempt)
+        // The daemon will try to initialize tray and increment counter
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // After interval ticks, retry count should have incremented
+        // (it may not succeed in test env, but counter should increment)
+        let retry_count = tray_retry_count_clone.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(retry_count > 0, "Retry count should have incremented, got {}", retry_count);
+        assert!(retry_count <= 3, "Retry count should not exceed 3, got {}", retry_count);
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
 }
