@@ -114,9 +114,20 @@ cargo build --release
 The binaries will be available at:
 - `target/release/autogit-daemon`
 - `target/release/autogit`
+ 
+## OpenSuSE Tumbleweed
 
-## Installation
+```bash
+sudo zypper addrepo https://download.opensuse.org/repositories/home:/brezel/openSUSE_Tumbleweed/ home:brezel
+sudo zypper refresh
+sudo zypper install autogit
+```
 
+This will install the systemd service automatically, you just have to enable it (see below)
+
+## Manuall Installation
+
+### Manuall installation
 ```bash
 # Build the project
 cargo build --release
