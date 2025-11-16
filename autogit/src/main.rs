@@ -37,6 +37,12 @@ async fn main() -> Result<()> {
         Commands::Now => {
             commands::trigger_now().await?;
         }
+        Commands::Suspend => {
+            commands::suspend_daemon().await?;
+        }
+        Commands::Resume => {
+            commands::resume_daemon().await?;
+        }
     }
 
     Ok(())

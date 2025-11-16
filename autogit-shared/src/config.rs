@@ -18,18 +18,27 @@ pub struct DaemonConfig {
     /// How often to check for changes (in seconds)
     #[serde(default = "default_check_interval")]
     pub check_interval_seconds: u64,
+
+    /// Whether to show system tray icon
+    #[serde(default = "default_enable_tray")]
+    pub enable_tray: bool,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             check_interval_seconds: default_check_interval(),
+            enable_tray: default_enable_tray(),
         }
     }
 }
 
 fn default_check_interval() -> u64 {
     300 // 5 minutes
+}
+
+fn default_enable_tray() -> bool {
+    true
 }
 
 /// Repository configuration
@@ -125,6 +134,7 @@ mod tests {
         let config = Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 60,
+                enable_tray: true,
             },
             repositories: vec![
                 Repository {
@@ -192,6 +202,7 @@ mod tests {
         let config = Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 120,
+                enable_tray: true,
             },
             repositories: vec![
                 Repository {
@@ -226,6 +237,7 @@ mod tests {
         let config = Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 60,
+                enable_tray: true,
             },
             repositories: vec![],
         };
@@ -256,6 +268,7 @@ mod tests {
             let config = Config {
                 daemon: DaemonConfig {
                     check_interval_seconds: interval,
+                    enable_tray: true,
                 },
                 repositories: vec![],
             };

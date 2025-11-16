@@ -293,6 +293,40 @@ pub async fn trigger_now() -> Result<()> {
     Ok(())
 }
 
+/// Suspend the daemon (stop automatic syncing)
+pub async fn suspend_daemon() -> Result<()> {
+    println!("{} Suspending daemon...", "→".blue());
+
+    // Send suspend command to daemon
+    let response = send_daemon_command(DaemonCommand::Suspend).await?;
+
+    // Check response status
+    if response.status != ResponseStatus::Ok {
+        bail!("Daemon returned error: {}", response.message);
+    }
+
+    println!("{} {}", "✓".green().bold(), response.message);
+
+    Ok(())
+}
+
+/// Resume the daemon (restart automatic syncing)
+pub async fn resume_daemon() -> Result<()> {
+    println!("{} Resuming daemon...", "→".blue());
+
+    // Send resume command to daemon
+    let response = send_daemon_command(DaemonCommand::Resume).await?;
+
+    // Check response status
+    if response.status != ResponseStatus::Ok {
+        bail!("Daemon returned error: {}", response.message);
+    }
+
+    println!("{} {}", "✓".green().bold(), response.message);
+
+    Ok(())
+}
+
 /// Expand ~ and canonicalize path
 fn expand_path(path: &str) -> Result<PathBuf> {
     let expanded = if path.starts_with("~/") {

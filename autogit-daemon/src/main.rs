@@ -1,5 +1,6 @@
 mod git;
 mod socket;
+mod tray;
 
 use anyhow::{Context, Result};
 use autogit_shared::Config;
@@ -85,6 +86,33 @@ async fn main() -> Result<()> {
     let socket_listener = socket::create_listener()
         .context("Failed to create Unix socket listener")?;
 
+    // Set up system tray icon with suspended state (optional - won't fail if no tray available)
+    let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
+
+    // Check if tray is enabled in config
+    let enable_tray = config.read().await.daemon.enable_tray;
+    let initial_tray = if enable_tray {
+        let repo_count = config.read().await.repositories.len();
+        let tray = tray::AutogitTray::new(repo_count, tray_action_tx.clone(), suspended.clone());
+        match tray.spawn_tray().await {
+            Ok(handle) => {
+                info!("System tray icon spawned successfully");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!("Failed to spawn system tray icon (no desktop environment?): {:#}", e);
+                warn!("Daemon will continue without tray icon");
+                None
+            }
+        }
+    } else {
+        info!("System tray disabled in configuration");
+        None
+    };
+
+    let tray_handle = Arc::new(RwLock::new(initial_tray));
+
     // Set up signal handling for graceful shutdown
     let sigterm = signal(SignalKind::terminate())
         .context("Failed to create SIGTERM handler")?;
@@ -95,7 +123,19 @@ async fn main() -> Result<()> {
     let start_time = Instant::now();
 
     // Start the main daemon loop
-    run_daemon(config, config_path_clone, reload_rx, sigterm, sigint, socket_listener, start_time).await?;
+    run_daemon(
+        config,
+        config_path_clone,
+        reload_rx,
+        sigterm,
+        sigint,
+        socket_listener,
+        start_time,
+        tray_handle,
+        tray_action_rx,
+        suspended,
+        tray_action_tx,
+    ).await?;
 
     // Keep watcher alive until daemon exits
     drop(watcher);
@@ -115,6 +155,10 @@ pub(crate) async fn run_daemon(
     mut sigint: tokio::signal::unix::Signal,
     socket_listener: tokio::net::UnixListener,
     start_time: Instant,
+    tray_handle: Arc<RwLock<Option<ksni::Handle<tray::AutogitTray>>>>,
+    mut tray_action_rx: mpsc::Receiver<tray::TrayAction>,
+    suspended: Arc<std::sync::atomic::AtomicBool>,
+    tray_action_tx: mpsc::Sender<tray::TrayAction>,
 ) -> Result<()> {
     let mut interval = {
         let cfg = config.read().await;
@@ -143,14 +187,27 @@ pub(crate) async fn run_daemon(
             // Handle incoming socket connections
             Ok((stream, _addr)) = socket_listener.accept() => {
                 let config_clone = Arc::clone(&config);
+                let suspended_clone = Arc::clone(&suspended);
                 tokio::spawn(async move {
-                    socket::handle_connection(stream, config_clone, start_time).await;
+                    socket::handle_connection(stream, config_clone, start_time, suspended_clone).await;
                 });
             }
 
             _ = interval.tick() => {
+                // Skip if daemon is suspended
+                if suspended.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+
                 // Normal check cycle
+                if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                    tray.update(|t| {
+                        let _ = t.set_status(tray::TrayStatus::Syncing);
+                    }).await;
+                }
+
                 let cfg = config.read().await;
+                let mut any_errors = false;
 
                 // Process each repository
                 for repo in &cfg.repositories {
@@ -166,7 +223,21 @@ pub(crate) async fn run_daemon(
                         }
                         Err(e) => {
                             error!("Error processing repository {}: {:#}", repo.path.display(), e);
+                            any_errors = true;
                         }
+                    }
+                }
+
+                // Update tray status
+                if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                    if any_errors {
+                        tray.update(|t| {
+                            let _ = t.increment_errors();
+                        }).await;
+                    } else {
+                        tray.update(|t| {
+                            let _ = t.set_last_sync();
+                        }).await;
                     }
                 }
             }
@@ -177,12 +248,13 @@ pub(crate) async fn run_daemon(
 
                 match Config::load(&config_path) {
                     Ok(new_config) => {
-                        let old_interval = {
+                        let (old_interval, old_enable_tray) = {
                             let cfg = config.read().await;
-                            cfg.daemon.check_interval_seconds
+                            (cfg.daemon.check_interval_seconds, cfg.daemon.enable_tray)
                         };
 
                         let new_interval = new_config.daemon.check_interval_seconds;
+                        let new_enable_tray = new_config.daemon.enable_tray;
 
                         // Find new repositories (those not in old config)
                         let new_repos: Vec<_> = {
@@ -216,8 +288,15 @@ pub(crate) async fn run_daemon(
                         // Update config
                         *config.write().await = new_config;
 
-                        info!("Configuration reloaded successfully with {} repositories",
-                              config.read().await.repositories.len());
+                        let new_repo_count = config.read().await.repositories.len();
+                        info!("Configuration reloaded successfully with {} repositories", new_repo_count);
+
+                        // Update tray with new repository count
+                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                            tray.update(|t| {
+                                let _ = t.set_repo_count(new_repo_count);
+                            }).await;
+                        }
 
                         // Update interval if it changed
                         if old_interval != new_interval {
@@ -225,10 +304,109 @@ pub(crate) async fn run_daemon(
                                   old_interval, new_interval);
                             interval = tokio::time::interval(std::time::Duration::from_secs(new_interval));
                         }
+
+                        // Handle tray enable/disable changes
+                        if old_enable_tray != new_enable_tray {
+                            if new_enable_tray {
+                                // Tray was disabled, now enable it
+                                info!("System tray enabled in configuration, spawning tray icon");
+                                let repo_count = new_repo_count;
+                                let tray = tray::AutogitTray::new(repo_count, tray_action_tx.clone(), suspended.clone());
+                                match tray.spawn_tray().await {
+                                    Ok(handle) => {
+                                        info!("System tray icon spawned successfully");
+                                        *tray_handle.write().await = Some(handle);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to spawn system tray icon: {:#}", e);
+                                        warn!("Tray will remain disabled");
+                                    }
+                                }
+                            } else {
+                                // Tray was enabled, now disable it
+                                info!("System tray disabled in configuration, removing tray icon");
+                                *tray_handle.write().await = None;
+                                info!("System tray icon removed");
+                            }
+                        }
                     }
                     Err(e) => {
                         error!("Failed to reload configuration: {:#}", e);
                         warn!("Keeping previous configuration");
+                    }
+                }
+            }
+
+            // Handle tray icon actions
+            Some(action) = tray_action_rx.recv() => {
+                match action {
+                    tray::TrayAction::TriggerSync => {
+                        // Skip if suspended
+                        if suspended.load(std::sync::atomic::Ordering::Relaxed) {
+                            info!("Manual sync skipped (daemon is suspended)");
+                            continue;
+                        }
+
+                        info!("Manual sync triggered from tray icon");
+                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                            tray.update(|t| {
+                                let _ = t.set_status(tray::TrayStatus::Syncing);
+                            }).await;
+                        }
+
+                        let cfg = config.read().await;
+                        let mut any_errors = false;
+
+                        for repo in &cfg.repositories {
+                            if !repo.auto_commit {
+                                continue;
+                            }
+
+                            match git::check_and_commit(repo).await {
+                                Ok(committed) => {
+                                    if committed {
+                                        info!("Committed changes in: {}", repo.path.display());
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Error processing repository {}: {:#}", repo.path.display(), e);
+                                    any_errors = true;
+                                }
+                            }
+                        }
+
+                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                            if any_errors {
+                                tray.update(|t| {
+                                    let _ = t.increment_errors();
+                                }).await;
+                            } else {
+                                tray.update(|t| {
+                                    let _ = t.set_last_sync();
+                                }).await;
+                            }
+                        }
+                    }
+
+                    tray::TrayAction::ToggleSuspend => {
+                        let new_state = !suspended.load(std::sync::atomic::Ordering::Relaxed);
+                        suspended.store(new_state, std::sync::atomic::Ordering::Relaxed);
+
+                        if new_state {
+                            info!("Daemon suspended");
+                        } else {
+                            info!("Daemon resumed");
+                        }
+
+                        // Update tray to reflect new state
+                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                            tray.update(|_t| {}).await;
+                        }
+                    }
+
+                    tray::TrayAction::Quit => {
+                        info!("Quit requested from tray icon");
+                        break;
                     }
                 }
             }
@@ -252,6 +430,7 @@ mod tests {
         Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 1, // Short interval for testing
+                enable_tray: false, // Disable tray in tests
             },
             repositories: vec![],
         }
@@ -291,6 +470,12 @@ mod tests {
         let config_clone = Arc::clone(&config);
         let config_path_clone = config_path.clone();
 
+        // Create tray-related test parameters
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -301,6 +486,10 @@ mod tests {
                 sigint,
                 socket_listener,
                 start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
             ).await;
         });
 
@@ -362,6 +551,12 @@ mod tests {
         let config_clone = Arc::clone(&config);
         let config_path_clone = config_path.clone();
 
+        // Create tray-related test parameters
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -372,6 +567,10 @@ mod tests {
                 sigint,
                 socket_listener,
                 start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
             ).await;
         });
 
@@ -445,6 +644,12 @@ mod tests {
         let config_clone = Arc::clone(&config);
         let config_path_clone = config_path.clone();
 
+        // Create tray-related test parameters
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -455,6 +660,10 @@ mod tests {
                 sigint,
                 socket_listener,
                 start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
             ).await;
         });
 
@@ -513,6 +722,12 @@ mod tests {
         let config_clone = Arc::clone(&config);
         let config_path_clone = config_path.clone();
 
+        // Create tray-related test parameters
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -523,6 +738,10 @@ mod tests {
                 sigint,
                 socket_listener,
                 start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
             ).await;
         });
 
@@ -590,6 +809,12 @@ mod tests {
         let config_clone = Arc::clone(&config);
         let config_path_clone = config_path.clone();
 
+        // Create tray-related test parameters
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -600,6 +825,10 @@ mod tests {
                 sigint,
                 socket_listener,
                 start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
             ).await;
         });
 
@@ -641,6 +870,12 @@ mod tests {
         let config_clone = Arc::clone(&config);
         let config_path_clone = config_path.clone();
 
+        // Create tray-related test parameters
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
             let _ = run_daemon(
@@ -651,6 +886,10 @@ mod tests {
                 sigint,
                 socket_listener,
                 start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
             ).await;
         });
 

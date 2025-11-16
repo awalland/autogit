@@ -53,8 +53,9 @@ pub async fn handle_connection(
     stream: UnixStream,
     config: Arc<RwLock<Config>>,
     start_time: Instant,
+    suspended: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if let Err(e) = handle_connection_impl(stream, config, start_time).await {
+    if let Err(e) = handle_connection_impl(stream, config, start_time, suspended).await {
         error!("Error handling socket connection: {:#}", e);
     }
 }
@@ -63,6 +64,7 @@ async fn handle_connection_impl(
     stream: UnixStream,
     config: Arc<RwLock<Config>>,
     start_time: Instant,
+    suspended: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -88,10 +90,16 @@ async fn handle_connection_impl(
             Response::ok("pong")
         }
         Command::Status => {
-            handle_status_command(config, start_time).await
+            handle_status_command(config, start_time, suspended.clone()).await
         }
         Command::Trigger => {
             handle_trigger_command(config).await
+        }
+        Command::Suspend => {
+            handle_suspend_command(suspended.clone()).await
+        }
+        Command::Resume => {
+            handle_resume_command(suspended.clone()).await
         }
     };
 
@@ -110,12 +118,23 @@ async fn handle_connection_impl(
     Ok(())
 }
 
-async fn handle_status_command(config: Arc<RwLock<Config>>, start_time: Instant) -> Response {
+async fn handle_status_command(
+    config: Arc<RwLock<Config>>,
+    start_time: Instant,
+    suspended: Arc<std::sync::atomic::AtomicBool>,
+) -> Response {
     let cfg = config.read().await;
     let uptime = start_time.elapsed().as_secs();
+    let is_suspended = suspended.load(std::sync::atomic::Ordering::Relaxed);
+
+    let message = if is_suspended {
+        "Daemon status (suspended)"
+    } else {
+        "Daemon status"
+    };
 
     Response::ok_with_data(
-        "Daemon status",
+        message,
         ResponseData::Status {
             uptime_seconds: uptime,
             check_interval_seconds: cfg.daemon.check_interval_seconds,
@@ -180,6 +199,28 @@ async fn handle_trigger_command(config: Arc<RwLock<Config>>) -> Response {
     )
 }
 
+async fn handle_suspend_command(suspended: Arc<std::sync::atomic::AtomicBool>) -> Response {
+    let was_suspended = suspended.swap(true, std::sync::atomic::Ordering::Relaxed);
+
+    if was_suspended {
+        Response::ok("Daemon was already suspended")
+    } else {
+        info!("Daemon suspended via socket command");
+        Response::ok("Daemon suspended")
+    }
+}
+
+async fn handle_resume_command(suspended: Arc<std::sync::atomic::AtomicBool>) -> Response {
+    let was_suspended = suspended.swap(false, std::sync::atomic::Ordering::Relaxed);
+
+    if !was_suspended {
+        Response::ok("Daemon was already running")
+    } else {
+        info!("Daemon resumed via socket command");
+        Response::ok("Daemon resumed")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +235,7 @@ mod tests {
         Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 300,
+                enable_tray: false,
             },
             repositories: vec![],
         }
@@ -203,6 +245,7 @@ mod tests {
         Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 120,
+                enable_tray: false,
             },
             repositories: vec![
                 Repository {
@@ -228,8 +271,9 @@ mod tests {
     async fn test_handle_status_command_empty_config() {
         let config = Arc::new(RwLock::new(create_test_config()));
         let start_time = Instant::now();
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let response = handle_status_command(config, start_time).await;
+        let response = handle_status_command(config, start_time, suspended).await;
 
         assert_eq!(response.status, ResponseStatus::Ok);
         assert_eq!(response.message, "Daemon status");
@@ -247,10 +291,11 @@ mod tests {
     async fn test_handle_status_command_with_repos() {
         let config = Arc::new(RwLock::new(create_test_config_with_repos()));
         let start_time = Instant::now();
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let response = handle_status_command(config, start_time).await;
+        let response = handle_status_command(config, start_time, suspended).await;
 
         assert_eq!(response.status, ResponseStatus::Ok);
 
@@ -268,8 +313,9 @@ mod tests {
     async fn test_handle_status_command_uptime() {
         let config = Arc::new(RwLock::new(create_test_config()));
         let start_time = Instant::now() - Duration::from_secs(5);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let response = handle_status_command(config, start_time).await;
+        let response = handle_status_command(config, start_time, suspended).await;
 
         if let Some(ResponseData::Status { uptime_seconds, .. }) = response.data {
             assert!(uptime_seconds >= 5);
@@ -453,8 +499,9 @@ mod tests {
             config.daemon.check_interval_seconds = interval;
             let config = Arc::new(RwLock::new(config));
             let start_time = Instant::now();
+            let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-            let response = handle_status_command(config, start_time).await;
+            let response = handle_status_command(config, start_time, suspended).await;
 
             if let Some(ResponseData::Status { check_interval_seconds, .. }) = response.data {
                 assert_eq!(check_interval_seconds, interval);
@@ -468,7 +515,8 @@ mod tests {
     async fn test_response_messages() {
         // Test status message
         let config = Arc::new(RwLock::new(create_test_config()));
-        let response = handle_status_command(config.clone(), Instant::now()).await;
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let response = handle_status_command(config.clone(), Instant::now(), suspended).await;
         assert_eq!(response.message, "Daemon status");
 
         // Test trigger message format

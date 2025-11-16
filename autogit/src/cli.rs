@@ -60,4 +60,10 @@ pub enum Commands {
 
     /// Trigger an immediate check and commit cycle
     Now,
+
+    /// Suspend the daemon (stop automatic syncing)
+    Suspend,
+
+    /// Resume the daemon (restart automatic syncing)
+    Resume,
 }
