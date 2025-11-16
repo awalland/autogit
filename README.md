@@ -2,7 +2,7 @@
 [![Rust](https://github.com/awalland/autogit/actions/workflows/rust.yml/badge.svg)](https://github.com/awalland/autogit/actions/workflows/rust.yml)
 # autogit
 
-Automatic git commit daemon with a simple CLI configuration tool.
+Automatic git commit daemon with a simple CLI configuration tool and system tray icon support.
 
 ## Overview
 
