@@ -186,15 +186,15 @@ impl Tray for AutogitTray {
         let suspended = self.is_suspended();
 
         let error_text = if state.error_count > 0 {
-            format!("⚠ {} errors", state.error_count)
+            format!("{} errors", state.error_count)
         } else {
-            "✓ No errors".to_owned()
+            "No errors".to_owned()
         };
 
         let status_text = if suspended {
-            "⏸ Suspended"
+            "Suspended"
         } else {
-            "✓ Active"
+            "Active"
         };
 
         vec![
@@ -221,7 +221,7 @@ impl Tray for AutogitTray {
 
             // Actions
             StandardItem {
-                label: if suspended { "▶ Resume" } else { "⏸ Suspend" }.into(),
+                label: if suspended { "Resume" } else { "Suspend" }.into(),
                 activate: Box::new(|this: &mut Self| {
                     let tx = this.trigger_tx.clone();
                     tokio::spawn(async move {
@@ -234,7 +234,7 @@ impl Tray for AutogitTray {
             }.into(),
 
             StandardItem {
-                label: "⚡ Sync Now".into(),
+                label: "Sync Now".into(),
                 enabled: !suspended,
                 activate: Box::new(|this: &mut Self| {
                     let tx = this.trigger_tx.clone();
@@ -251,7 +251,7 @@ impl Tray for AutogitTray {
 
             // Quit
             StandardItem {
-                label: "🚪 Quit Autogit".into(),
+                label: "Quit Autogit".into(),
                 activate: Box::new(|this: &mut Self| {
                     let tx = this.trigger_tx.clone();
                     tokio::spawn(async move {
@@ -559,7 +559,7 @@ mod tests {
 
         // Find the suspend/resume item (should be 5th item, index 4)
         if let MenuItem::Standard(ref item) = menu[4] {
-            assert_eq!(item.label, "⏸ Suspend");
+            assert_eq!(item.label, "Suspend");
         } else {
             panic!("Expected StandardItem at index 4");
         }
@@ -568,7 +568,7 @@ mod tests {
         suspended.store(true, std::sync::atomic::Ordering::Relaxed);
         let menu = tray.menu();
         if let MenuItem::Standard(ref item) = menu[4] {
-            assert_eq!(item.label, "▶ Resume");
+            assert_eq!(item.label, "Resume");
         } else {
             panic!("Expected StandardItem at index 4");
         }
