@@ -20,6 +20,10 @@ pub enum Command {
     Status,
     /// Ping the daemon to check if it's alive
     Ping,
+    /// Suspend the daemon (stop automatic syncing)
+    Suspend,
+    /// Resume the daemon (restart automatic syncing)
+    Resume,
 }
 
 /// Response from the daemon
