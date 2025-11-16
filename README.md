@@ -105,6 +105,17 @@ You can use the following placeholders in commit message templates:
 - `{date}`: Date only (e.g., "2025-11-15")
 - `{time}`: Time only (e.g., "14:30:00")
 
+
+## OpenSuSE Tumbleweed RPM installation
+
+```bash
+sudo zypper addrepo https://download.opensuse.org/repositories/home:/brezel/openSUSE_Tumbleweed/ home:brezel
+sudo zypper refresh
+sudo zypper install autogit
+```
+
+This will install the systemd service automatically, you just have to enable it (see below)
+
 ## Building
 
 ```bash
@@ -114,16 +125,6 @@ cargo build --release
 The binaries will be available at:
 - `target/release/autogit-daemon`
 - `target/release/autogit`
- 
-## OpenSuSE Tumbleweed
-
-```bash
-sudo zypper addrepo https://download.opensuse.org/repositories/home:/brezel/openSUSE_Tumbleweed/ home:brezel
-sudo zypper refresh
-sudo zypper install autogit
-```
-
-This will install the systemd service automatically, you just have to enable it (see below)
 
 ## Manuall Installation
 
