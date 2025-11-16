@@ -25,7 +25,6 @@ pub struct AutogitTray {
 #[derive(Debug, Clone)]
 struct TrayState {
     pub status: TrayStatus,
-    pub start_time: Instant,
     pub last_sync: Option<Instant>,
     pub repo_count: usize,
     pub error_count: usize,
@@ -48,7 +47,6 @@ impl AutogitTray {
     ) -> Self {
         let state = TrayState {
             status: TrayStatus::Idle,
-            start_time: Instant::now(),
             last_sync: None,
             repo_count,
             error_count: 0,
@@ -64,13 +62,6 @@ impl AutogitTray {
     /// Check if daemon is suspended
     pub fn is_suspended(&self) -> bool {
         self.suspended.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Toggle suspend state
-    pub fn toggle_suspend(&self) -> bool {
-        let current = self.suspended.load(std::sync::atomic::Ordering::Relaxed);
-        self.suspended.store(!current, std::sync::atomic::Ordering::Relaxed);
-        !current
     }
 
     /// Update the tray status
@@ -93,15 +84,6 @@ impl AutogitTray {
         state.status = TrayStatus::Error;
     }
 
-    /// Reset error count
-    pub fn reset_errors(&self) {
-        let mut state = self.status.write().unwrap();
-        state.error_count = 0;
-        if state.status == TrayStatus::Error {
-            state.status = TrayStatus::Idle;
-        }
-    }
-
     /// Update repository count
     pub fn set_repo_count(&self, count: usize) {
         let mut state = self.status.write().unwrap();
@@ -115,35 +97,6 @@ impl AutogitTray {
         let handle = TrayMethods::spawn(self).await?;
         info!("System tray icon spawned");
         Ok(handle)
-    }
-
-    /// Format uptime as human-readable string
-    fn format_uptime(elapsed: std::time::Duration) -> String {
-        let seconds = elapsed.as_secs();
-        let hours = seconds / 3600;
-        let minutes = (seconds % 3600) / 60;
-        let secs = seconds % 60;
-
-        if hours > 0 {
-            format!("{}h {}m", hours, minutes)
-        } else if minutes > 0 {
-            format!("{}m {}s", minutes, secs)
-        } else {
-            format!("{}s", secs)
-        }
-    }
-
-    /// Format time ago as human-readable string
-    fn format_time_ago(instant: Instant) -> String {
-        let elapsed = instant.elapsed().as_secs();
-
-        if elapsed < 60 {
-            format!("{} sec ago", elapsed)
-        } else if elapsed < 3600 {
-            format!("{} min ago", elapsed / 60)
-        } else {
-            format!("{} hr ago", elapsed / 3600)
-        }
     }
 
     /// Get current state (for sync Tray trait)
@@ -204,7 +157,7 @@ impl Tray for AutogitTray {
         let state = self.get_state();
         let suspended = self.is_suspended();
 
-        // Load icon with actual dimensions from PNG file
+        // Render SVG at optimal size for system tray
         let (width, height, data) = if suspended {
             create_pause_icon()
         } else {
@@ -215,25 +168,11 @@ impl Tray for AutogitTray {
             }
         };
 
-        // Provide multiple sizes for better display across different DPIs
-        // System tray will choose the most appropriate size
-        let mut icons = vec![Icon {
+        vec![Icon {
             width,
             height,
-            data: data.clone(),
-        }];
-
-        // Also provide a 32x32 scaled version if original is larger
-        if width > 32 || height > 32 {
-            let (scaled_width, scaled_height, scaled_data) = scale_icon_to_32(&data, width, height);
-            icons.push(Icon {
-                width: scaled_width,
-                height: scaled_height,
-                data: scaled_data,
-            });
-        }
-
-        icons
+            data,
+        }]
     }
 
     fn attention_icon_name(&self) -> String {
@@ -244,23 +183,11 @@ impl Tray for AutogitTray {
         let state = self.get_state();
         if state.error_count > 0 {
             let (width, height, data) = create_error_icon();
-            let mut icons = vec![Icon {
+            vec![Icon {
                 width,
                 height,
-                data: data.clone(),
-            }];
-
-            // Also provide 32x32 scaled version
-            if width > 32 || height > 32 {
-                let (scaled_width, scaled_height, scaled_data) = scale_icon_to_32(&data, width, height);
-                icons.push(Icon {
-                    width: scaled_width,
-                    height: scaled_height,
-                    data: scaled_data,
-                });
-            }
-
-            icons
+                data,
+            }]
         } else {
             vec![]
         }
@@ -336,7 +263,7 @@ impl Tray for AutogitTray {
 
             // Quit
             StandardItem {
-                label: "🚪 Quit Daemon".into(),
+                label: "🚪 Quit autogit".into(),
                 activate: Box::new(|this: &mut Self| {
                     let tx = this.trigger_tx.clone();
                     tokio::spawn(async move {
@@ -371,9 +298,9 @@ fn load_png_icon(png_bytes: &[u8]) -> (i32, i32, Vec<u8>) {
 
     // Convert to RGBA8 format (required by StatusNotifierItem)
     let rgba = img.to_rgba8();
+    let data = rgba.into_raw();
 
-    // Return dimensions and raw pixel data (RGBA bytes)
-    (width, height, rgba.into_raw())
+    (width, height, data)
 }
 
 fn create_idle_icon() -> (i32, i32, Vec<u8>) {
@@ -396,17 +323,310 @@ fn create_pause_icon() -> (i32, i32, Vec<u8>) {
     load_png_icon(ICON_BYTES)
 }
 
-// Scale an icon to 32x32 for better tray compatibility
-fn scale_icon_to_32(data: &[u8], width: i32, height: i32) -> (i32, i32, Vec<u8>) {
-    use image::{RgbaImage, imageops::FilterType};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
 
-    // Create image from raw RGBA data
-    let img = RgbaImage::from_raw(width as u32, height as u32, data.to_vec())
-        .expect("Failed to create image from icon data");
+    fn create_test_tray() -> (AutogitTray, mpsc::Receiver<TrayAction>) {
+        let (tx, rx) = mpsc::channel(10);
+        let suspended = Arc::new(AtomicBool::new(false));
+        let tray = AutogitTray::new(3, tx, suspended);
+        (tray, rx)
+    }
 
-    // Resize to 32x32 using high-quality Lanczos3 filter
-    let resized = image::imageops::resize(&img, 32, 32, FilterType::Lanczos3);
+    #[test]
+    fn test_new_tray_initial_state() {
+        let (tray, _rx) = create_test_tray();
+        let state = tray.get_state();
 
-    // Return dimensions and raw pixel data
-    (32, 32, resized.into_raw())
+        assert_eq!(state.status, TrayStatus::Idle);
+        assert_eq!(state.repo_count, 3);
+        assert_eq!(state.error_count, 0);
+        assert!(state.last_sync.is_none());
+        assert!(!tray.is_suspended());
+    }
+
+    #[test]
+    fn test_set_status() {
+        let (tray, _rx) = create_test_tray();
+
+        tray.set_status(TrayStatus::Syncing);
+        assert_eq!(tray.get_state().status, TrayStatus::Syncing);
+
+        tray.set_status(TrayStatus::Error);
+        assert_eq!(tray.get_state().status, TrayStatus::Error);
+
+        tray.set_status(TrayStatus::Idle);
+        assert_eq!(tray.get_state().status, TrayStatus::Idle);
+    }
+
+    #[test]
+    fn test_set_last_sync() {
+        let (tray, _rx) = create_test_tray();
+
+        assert!(tray.get_state().last_sync.is_none());
+
+        tray.set_last_sync();
+
+        let state = tray.get_state();
+        assert!(state.last_sync.is_some());
+        assert_eq!(state.status, TrayStatus::Idle);
+    }
+
+    #[test]
+    fn test_increment_errors() {
+        let (tray, _rx) = create_test_tray();
+
+        assert_eq!(tray.get_state().error_count, 0);
+
+        tray.increment_errors();
+        assert_eq!(tray.get_state().error_count, 1);
+        assert_eq!(tray.get_state().status, TrayStatus::Error);
+
+        tray.increment_errors();
+        assert_eq!(tray.get_state().error_count, 2);
+        assert_eq!(tray.get_state().status, TrayStatus::Error);
+    }
+
+    #[test]
+    fn test_set_repo_count() {
+        let (tray, _rx) = create_test_tray();
+
+        assert_eq!(tray.get_state().repo_count, 3);
+
+        tray.set_repo_count(5);
+        assert_eq!(tray.get_state().repo_count, 5);
+
+        tray.set_repo_count(0);
+        assert_eq!(tray.get_state().repo_count, 0);
+    }
+
+    #[test]
+    fn test_is_suspended() {
+        let (tx, _rx) = mpsc::channel(10);
+        let suspended = Arc::new(AtomicBool::new(false));
+        let tray = AutogitTray::new(1, tx, suspended.clone());
+
+        assert!(!tray.is_suspended());
+
+        suspended.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(tray.is_suspended());
+
+        suspended.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!tray.is_suspended());
+    }
+
+    #[test]
+    fn test_tray_title_idle() {
+        let (tray, _rx) = create_test_tray();
+        tray.set_status(TrayStatus::Idle);
+
+        assert_eq!(tray.title(), "Autogit Daemon");
+    }
+
+    #[test]
+    fn test_tray_title_syncing() {
+        let (tray, _rx) = create_test_tray();
+        tray.set_status(TrayStatus::Syncing);
+
+        assert_eq!(tray.title(), "Autogit - Syncing...");
+    }
+
+    #[test]
+    fn test_tray_title_error() {
+        let (tray, _rx) = create_test_tray();
+        tray.increment_errors();
+
+        assert_eq!(tray.title(), "Autogit - 1 errors");
+
+        tray.increment_errors();
+        assert_eq!(tray.title(), "Autogit - 2 errors");
+    }
+
+    #[test]
+    fn test_tray_title_suspended() {
+        let (tx, _rx) = mpsc::channel(10);
+        let suspended = Arc::new(AtomicBool::new(true));
+        let tray = AutogitTray::new(1, tx, suspended);
+
+        assert_eq!(tray.title(), "Autogit - Suspended");
+    }
+
+    #[test]
+    fn test_tray_icon_name_idle() {
+        let (tray, _rx) = create_test_tray();
+        tray.set_status(TrayStatus::Idle);
+
+        assert_eq!(tray.icon_name(), "emblem-default");
+    }
+
+    #[test]
+    fn test_tray_icon_name_syncing() {
+        let (tray, _rx) = create_test_tray();
+        tray.set_status(TrayStatus::Syncing);
+
+        assert_eq!(tray.icon_name(), "view-refresh");
+    }
+
+    #[test]
+    fn test_tray_icon_name_error() {
+        let (tray, _rx) = create_test_tray();
+        tray.increment_errors();
+
+        assert_eq!(tray.icon_name(), "emblem-important");
+    }
+
+    #[test]
+    fn test_tray_icon_name_suspended() {
+        let (tx, _rx) = mpsc::channel(10);
+        let suspended = Arc::new(AtomicBool::new(true));
+        let tray = AutogitTray::new(1, tx, suspended);
+
+        assert_eq!(tray.icon_name(), "media-playback-pause");
+    }
+
+    #[test]
+    fn test_icon_pixmap_returns_valid_data() {
+        let (tray, _rx) = create_test_tray();
+
+        // Test idle icon
+        tray.set_status(TrayStatus::Idle);
+        let icons = tray.icon_pixmap();
+        assert_eq!(icons.len(), 1);
+        assert!(icons[0].width > 0);
+        assert!(icons[0].height > 0);
+        assert!(!icons[0].data.is_empty());
+
+        // Test syncing icon
+        tray.set_status(TrayStatus::Syncing);
+        let icons = tray.icon_pixmap();
+        assert_eq!(icons.len(), 1);
+        assert!(icons[0].width > 0);
+
+        // Test error icon
+        tray.increment_errors();
+        let icons = tray.icon_pixmap();
+        assert_eq!(icons.len(), 1);
+        assert!(icons[0].width > 0);
+    }
+
+    #[test]
+    fn test_attention_icon_pixmap_with_errors() {
+        let (tray, _rx) = create_test_tray();
+
+        // No errors - should be empty
+        let icons = tray.attention_icon_pixmap();
+        assert_eq!(icons.len(), 0);
+
+        // With errors - should return error icon
+        tray.increment_errors();
+        let icons = tray.attention_icon_pixmap();
+        assert_eq!(icons.len(), 1);
+        assert!(icons[0].width > 0);
+        assert!(icons[0].height > 0);
+        assert!(!icons[0].data.is_empty());
+    }
+
+    #[test]
+    fn test_tray_category() {
+        let (tray, _rx) = create_test_tray();
+        assert_eq!(tray.category(), ksni::Category::ApplicationStatus);
+    }
+
+    #[test]
+    fn test_tray_id() {
+        let (tray, _rx) = create_test_tray();
+        assert_eq!(tray.id(), env!("CARGO_PKG_NAME"));
+    }
+
+    #[test]
+    fn test_load_png_icon() {
+        // Test that icon loading works for all icon types
+        let (width, height, data) = create_idle_icon();
+        assert!(width > 0);
+        assert!(height > 0);
+        assert!(!data.is_empty());
+        // RGBA format means 4 bytes per pixel
+        assert_eq!(data.len(), (width * height * 4) as usize);
+
+        let (width, height, data) = create_syncing_icon();
+        assert!(width > 0);
+        assert_eq!(data.len(), (width * height * 4) as usize);
+
+        let (width, height, data) = create_error_icon();
+        assert!(width > 0);
+        assert_eq!(data.len(), (width * height * 4) as usize);
+
+        let (width, height, data) = create_pause_icon();
+        assert!(width > 0);
+        assert_eq!(data.len(), (width * height * 4) as usize);
+    }
+
+    #[test]
+    fn test_menu_items_count() {
+        let (tray, _rx) = create_test_tray();
+        let menu = tray.menu();
+
+        // Expected menu structure:
+        // - Repositories: X
+        // - Status: ...
+        // - Errors: ...
+        // - Separator
+        // - Suspend/Resume
+        // - Sync Now
+        // - Separator
+        // - Quit
+        assert_eq!(menu.len(), 8);
+    }
+
+    #[test]
+    fn test_menu_suspend_resume_label() {
+        // Test when not suspended
+        let (tx, _rx) = mpsc::channel(10);
+        let suspended = Arc::new(AtomicBool::new(false));
+        let tray = AutogitTray::new(1, tx.clone(), suspended.clone());
+        let menu = tray.menu();
+
+        // Find the suspend/resume item (should be 5th item, index 4)
+        if let MenuItem::Standard(ref item) = menu[4] {
+            assert_eq!(item.label, "⏸ Suspend");
+        } else {
+            panic!("Expected StandardItem at index 4");
+        }
+
+        // Test when suspended
+        suspended.store(true, std::sync::atomic::Ordering::Relaxed);
+        let menu = tray.menu();
+        if let MenuItem::Standard(ref item) = menu[4] {
+            assert_eq!(item.label, "▶ Resume");
+        } else {
+            panic!("Expected StandardItem at index 4");
+        }
+    }
+
+    #[test]
+    fn test_menu_sync_now_disabled_when_suspended() {
+        // Test when not suspended
+        let (tx, _rx) = mpsc::channel(10);
+        let suspended = Arc::new(AtomicBool::new(false));
+        let tray = AutogitTray::new(1, tx.clone(), suspended.clone());
+        let menu = tray.menu();
+
+        // Sync Now should be enabled (index 5)
+        if let MenuItem::Standard(ref item) = menu[5] {
+            assert!(item.enabled);
+        } else {
+            panic!("Expected StandardItem at index 5");
+        }
+
+        // Test when suspended
+        suspended.store(true, std::sync::atomic::Ordering::Relaxed);
+        let menu = tray.menu();
+        if let MenuItem::Standard(ref item) = menu[5] {
+            assert!(!item.enabled);
+        } else {
+            panic!("Expected StandardItem at index 5");
+        }
+    }
 }
