@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use autogit_shared::{Config, Repository, Command as DaemonCommand, Response, ResponseStatus, ResponseData, socket_path};
 use colored::Colorize;
 use std::path::PathBuf;
-use tabled::{Table, Tabled, settings::{Style, Width}};
+use tabled::{Table, Tabled, settings::{Style, Width, Modify, object::Columns}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -104,8 +104,8 @@ pub fn list_repositories() -> Result<()> {
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Width::wrap(80).keep_words())
-        .with(Width::increase(160));
+        .with(Modify::new(Columns::single(0)).with(Width::truncate(11).suffix("")))
+        .with(Modify::new(Columns::new(1..)).with(Width::wrap(60).keep_words()));
 
     println!("{}", table);
 
