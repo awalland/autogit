@@ -925,4 +925,363 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(&config_path);
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tray_action_trigger_sync() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let config = create_test_config();
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tray_action_tx_clone = tray_action_tx.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx_clone,
+            ).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Send TriggerSync action
+        tray_action_tx.send(tray::TrayAction::TriggerSync).await.unwrap();
+
+        // Give time for action to be processed
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Daemon should still be running
+        assert!(!daemon_handle.is_finished());
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tray_action_toggle_suspend() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let config = create_test_config();
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let suspended_clone = Arc::clone(&suspended);
+        let tray_action_tx_clone = tray_action_tx.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx_clone,
+            ).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Initially not suspended
+        assert!(!suspended_clone.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Send ToggleSuspend action
+        tray_action_tx.send(tray::TrayAction::ToggleSuspend).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Now should be suspended
+        assert!(suspended_clone.load(std::sync::atomic::Ordering::Relaxed));
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tray_action_quit() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let config = create_test_config();
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tray_action_tx_clone = tray_action_tx.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx_clone,
+            ).await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Send Quit action
+        tray_action_tx.send(tray::TrayAction::Quit).await.unwrap();
+
+        // Give time for graceful shutdown
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Daemon should have finished
+        assert!(daemon_handle.is_finished());
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_trigger_sync_when_suspended() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let config = create_test_config();
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true)); // Start suspended
+        let tray_action_tx_clone = tray_action_tx.clone();
+
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx_clone,
+            ).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Try to trigger sync while suspended (should be skipped)
+        tray_action_tx.send(tray::TrayAction::TriggerSync).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Daemon should still be running
+        assert!(!daemon_handle.is_finished());
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_interval_tick_when_suspended() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let mut config = create_test_config();
+        config.daemon.check_interval_seconds = 1; // Very short for testing
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (_reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true)); // Suspended
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
+            ).await;
+        });
+
+        // Let it run for multiple intervals while suspended
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Daemon should still be running (intervals skipped due to suspension)
+        assert!(!daemon_handle.is_finished());
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tray_enable_disable_via_config_reload() {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let temp_dir = TempDir::new().unwrap();
+        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+
+        let config_path = Config::default_config_path().unwrap();
+        let mut config = create_test_config();
+        config.daemon.enable_tray = false; // Start with tray disabled
+        config.save(&config_path).unwrap();
+
+        let config = Arc::new(RwLock::new(config));
+
+        let (reload_tx, reload_rx) = mpsc::channel(10);
+        let sigterm = signal(SignalKind::terminate()).unwrap();
+        let sigint = signal(SignalKind::interrupt()).unwrap();
+        let socket_listener = create_test_socket().await;
+        let start_time = Instant::now();
+
+        let config_clone = Arc::clone(&config);
+        let config_path_clone = config_path.clone();
+
+        let tray_handle = Arc::new(RwLock::new(None));
+        let (_tray_action_tx, tray_action_rx) = mpsc::channel(10);
+        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tray_action_tx, _tray_action_rx2) = mpsc::channel(10);
+
+        let daemon_handle = tokio::spawn(async move {
+            let _ = run_daemon(
+                config_clone,
+                config_path_clone,
+                reload_rx,
+                sigterm,
+                sigint,
+                socket_listener,
+                start_time,
+                tray_handle,
+                tray_action_rx,
+                suspended,
+                tray_action_tx,
+            ).await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Enable tray via config reload
+        let mut new_config = create_test_config();
+        new_config.daemon.enable_tray = true;
+        new_config.save(&config_path).unwrap();
+
+        reload_tx.send(()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Now disable tray again
+        let mut new_config = create_test_config();
+        new_config.daemon.enable_tray = false;
+        new_config.save(&config_path).unwrap();
+
+        reload_tx.send(()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        daemon_handle.abort();
+        let _ = std::fs::remove_file(&config_path);
+    }
 }

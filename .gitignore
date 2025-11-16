@@ -16,3 +16,4 @@ Thumbs.db
 # Config (for testing)
 test-config.toml
 autogit/completions/
+*.profraw
