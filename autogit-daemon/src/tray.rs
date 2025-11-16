@@ -123,7 +123,7 @@ impl Tray for AutogitTray {
             "Autogit - Suspended".to_owned()
         } else {
             match state.status {
-                TrayStatus::Idle => "Autogit Daemon".to_owned(),
+                TrayStatus::Idle => "Autogit".to_owned(),
                 TrayStatus::Syncing => "Autogit - Syncing...".to_owned(),
                 TrayStatus::Error => format!("Autogit - {} errors", state.error_count),
             }
@@ -131,21 +131,9 @@ impl Tray for AutogitTray {
     }
 
     fn icon_name(&self) -> String {
-        let state = self.get_state();
-        let suspended = self.is_suspended();
-
-        // Use standard icons that are more visible
-        // Try symbolic first for theme awareness, with fallback to regular colored icons
-        if suspended {
-            "media-playback-pause"
-        } else {
-            match state.status {
-                TrayStatus::Idle => "emblem-default",
-                TrayStatus::Syncing => "view-refresh",
-                TrayStatus::Error => "emblem-important",
-            }
-        }
-        .to_owned()
+        // Return empty string to force use of icon_pixmap (custom PNG icons)
+        // If we return icon names, KDE will prefer theme icons over our custom ones
+        String::new()
     }
 
     fn icon_theme_path(&self) -> String {
@@ -263,7 +251,7 @@ impl Tray for AutogitTray {
 
             // Quit
             StandardItem {
-                label: "🚪 Quit autogit".into(),
+                label: "🚪 Quit Autogit".into(),
                 activate: Box::new(|this: &mut Self| {
                     let tx = this.trigger_tx.clone();
                     tokio::spawn(async move {
@@ -422,7 +410,7 @@ mod tests {
         let (tray, _rx) = create_test_tray();
         tray.set_status(TrayStatus::Idle);
 
-        assert_eq!(tray.title(), "Autogit Daemon");
+        assert_eq!(tray.title(), "Autogit");
     }
 
     #[test]
@@ -454,36 +442,17 @@ mod tests {
     }
 
     #[test]
-    fn test_tray_icon_name_idle() {
+    fn test_tray_icon_name_always_empty() {
         let (tray, _rx) = create_test_tray();
-        tray.set_status(TrayStatus::Idle);
 
-        assert_eq!(tray.icon_name(), "emblem-default");
-    }
+        // icon_name should always be empty to force use of icon_pixmap
+        assert_eq!(tray.icon_name(), "");
 
-    #[test]
-    fn test_tray_icon_name_syncing() {
-        let (tray, _rx) = create_test_tray();
         tray.set_status(TrayStatus::Syncing);
+        assert_eq!(tray.icon_name(), "");
 
-        assert_eq!(tray.icon_name(), "view-refresh");
-    }
-
-    #[test]
-    fn test_tray_icon_name_error() {
-        let (tray, _rx) = create_test_tray();
         tray.increment_errors();
-
-        assert_eq!(tray.icon_name(), "emblem-important");
-    }
-
-    #[test]
-    fn test_tray_icon_name_suspended() {
-        let (tx, _rx) = mpsc::channel(10);
-        let suspended = Arc::new(AtomicBool::new(true));
-        let tray = AutogitTray::new(1, tx, suspended);
-
-        assert_eq!(tray.icon_name(), "media-playback-pause");
+        assert_eq!(tray.icon_name(), "");
     }
 
     #[test]

@@ -612,4 +612,415 @@ mod tests {
         assert!(message.ends_with("  "));
         assert!(message.contains("  ")); // Multiple spaces preserved
     }
+
+    // Helper to create a test git repository
+    fn create_test_repo() -> (tempfile::TempDir, GitRepository) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo = GitRepository::init(temp_dir.path()).unwrap();
+
+        // Configure git user for commits
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+
+        (temp_dir, repo)
+    }
+
+    // Helper to create a commit in a repo
+    fn create_test_commit(repo: &GitRepository, message: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+
+        let signature = Signature::now("Test User", "test@example.com").unwrap();
+
+        let parent = match repo.head() {
+            Ok(head) => {
+                let oid = head.target().unwrap();
+                Some(repo.find_commit(oid).unwrap())
+            }
+            Err(_) => None,
+        };
+
+        let parents = parent.as_ref().map(|c| vec![c]).unwrap_or_default();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        ).unwrap()
+    }
+
+    // Helper to write a file to a repo
+    fn write_test_file(repo_path: &Path, filename: &str, content: &str) {
+        std::fs::write(repo_path.join(filename), content).unwrap();
+    }
+
+    #[test]
+    fn test_open_repository_success() {
+        let (_temp, repo) = create_test_repo();
+        let result = open_repository(repo.path().parent().unwrap());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_open_repository_not_found() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = open_repository(temp_dir.path());
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("Not a git repository"));
+    }
+
+    #[test]
+    fn test_has_changes_empty_repo() {
+        let (_temp, repo) = create_test_repo();
+        let result = has_changes(&repo).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_has_changes_with_untracked_file() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let result = has_changes(&repo).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_has_changes_with_modified_file() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "initial");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        // Modify the file
+        write_test_file(temp.path(), "test.txt", "modified");
+
+        let result = has_changes(&repo).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_has_changes_clean_repo() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        let result = has_changes(&repo).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_has_staged_changes_none() {
+        let (_temp, repo) = create_test_repo();
+        let result = has_staged_changes(&repo).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_has_staged_changes_with_staged_file() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+
+        let result = has_staged_changes(&repo).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_stage_all_changes_new_file() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        stage_all_changes(&repo).unwrap();
+
+        let result = has_staged_changes(&repo).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_stage_all_changes_multiple_files() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "file1.txt", "content1");
+        write_test_file(temp.path(), "file2.txt", "content2");
+        write_test_file(temp.path(), "file3.txt", "content3");
+
+        stage_all_changes(&repo).unwrap();
+
+        let statuses = repo.statuses(None).unwrap();
+        let staged_count = statuses.iter()
+            .filter(|e| e.status().intersects(Status::INDEX_NEW))
+            .count();
+
+        assert_eq!(staged_count, 3);
+    }
+
+    #[test]
+    fn test_stage_all_changes_modified_file() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "initial");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        // Modify the file
+        write_test_file(temp.path(), "test.txt", "modified");
+
+        stage_all_changes(&repo).unwrap();
+
+        let result = has_staged_changes(&repo).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_create_commit_first_commit() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+
+        create_commit(&repo, "First commit").unwrap();
+
+        let head = repo.head().unwrap();
+        let commit = repo.find_commit(head.target().unwrap()).unwrap();
+        assert_eq!(commit.message().unwrap(), "First commit");
+    }
+
+    #[test]
+    fn test_create_commit_with_parent() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test1.txt", "content1");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test1.txt")).unwrap();
+        index.write().unwrap();
+        create_commit(&repo, "First commit").unwrap();
+
+        // Create second commit
+        write_test_file(temp.path(), "test2.txt", "content2");
+        index.add_path(Path::new("test2.txt")).unwrap();
+        index.write().unwrap();
+        create_commit(&repo, "Second commit").unwrap();
+
+        let head = repo.head().unwrap();
+        let commit = repo.find_commit(head.target().unwrap()).unwrap();
+        assert_eq!(commit.message().unwrap(), "Second commit");
+        assert_eq!(commit.parent_count(), 1);
+    }
+
+    #[test]
+    fn test_get_signature_success() {
+        let (_temp, repo) = create_test_repo();
+        let signature = get_signature(&repo).unwrap();
+        assert_eq!(signature.name().unwrap(), "Test User");
+        assert_eq!(signature.email().unwrap(), "test@example.com");
+    }
+
+    #[test]
+    fn test_get_signature_uses_repo_config() {
+        let (_temp, repo) = create_test_repo();
+
+        // We configured the repo with specific values
+        let signature = get_signature(&repo).unwrap();
+
+        // Should use the test config (not global config)
+        assert_eq!(signature.name().unwrap(), "Test User");
+        assert_eq!(signature.email().unwrap(), "test@example.com");
+    }
+
+    #[test]
+    fn test_push_changes_no_remote() {
+        let (_temp, repo) = create_test_repo();
+        let result = push_changes(&repo, repo.path().parent().unwrap()).unwrap();
+        assert!(!result); // Should return false when no remote
+    }
+
+    #[test]
+    fn test_pull_rebase_no_remote() {
+        let (_temp, repo) = create_test_repo();
+        let result = pull_rebase(&repo, repo.path().parent().unwrap()).unwrap();
+        assert!(!result); // Should return false when no remote
+    }
+
+    #[tokio::test]
+    async fn test_check_and_commit_no_changes() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        let repo_config = Repository {
+            path: temp.path().to_path_buf(),
+            auto_commit: true,
+            commit_message_template: "Auto: {timestamp}".to_owned(),
+        };
+
+        let committed = check_and_commit(&repo_config).await.unwrap();
+        assert!(!committed);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_commit_with_changes() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "initial");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        // Make a change
+        write_test_file(temp.path(), "test.txt", "modified");
+
+        let repo_config = Repository {
+            path: temp.path().to_path_buf(),
+            auto_commit: true,
+            commit_message_template: "Auto: {timestamp}".to_owned(),
+        };
+
+        let committed = check_and_commit(&repo_config).await.unwrap();
+        assert!(committed);
+
+        // Verify the commit was created
+        let repo_after = GitRepository::open(temp.path()).unwrap();
+        let head = repo_after.head().unwrap();
+        let commit = repo_after.find_commit(head.target().unwrap()).unwrap();
+        assert!(commit.message().unwrap().starts_with("Auto: "));
+    }
+
+    #[tokio::test]
+    async fn test_check_and_commit_with_new_file() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "initial.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("initial.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        // Add a new file
+        write_test_file(temp.path(), "newfile.txt", "new content");
+
+        let repo_config = Repository {
+            path: temp.path().to_path_buf(),
+            auto_commit: true,
+            commit_message_template: "New file added".to_owned(),
+        };
+
+        let committed = check_and_commit(&repo_config).await.unwrap();
+        assert!(committed);
+
+        // Verify the new file was committed
+        let repo_after = GitRepository::open(temp.path()).unwrap();
+        let head = repo_after.head().unwrap();
+        let commit = repo_after.find_commit(head.target().unwrap()).unwrap();
+        assert_eq!(commit.message().unwrap(), "New file added");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_repository_clean() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        let repo_config = Repository {
+            path: temp.path().to_path_buf(),
+            auto_commit: true,
+            commit_message_template: "Auto: {timestamp}".to_owned(),
+        };
+
+        // Should succeed without errors
+        let result = initialize_repository(&repo_config).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_repository_with_uncommitted_changes() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Initial commit");
+
+        // Add uncommitted change
+        write_test_file(temp.path(), "test.txt", "modified");
+
+        let repo_config = Repository {
+            path: temp.path().to_path_buf(),
+            auto_commit: true,
+            commit_message_template: "Auto: {timestamp}".to_owned(),
+        };
+
+        let result = initialize_repository(&repo_config).await;
+        assert!(result.is_ok());
+
+        // Verify the change was committed
+        let repo_after = GitRepository::open(temp.path()).unwrap();
+        let head = repo_after.head().unwrap();
+        let commit = repo_after.find_commit(head.target().unwrap()).unwrap();
+        assert_eq!(commit.message().unwrap(), "Auto-commit on daemon startup");
+    }
+
+    #[tokio::test]
+    async fn test_check_and_commit_respects_gitignore() {
+        let (temp, repo) = create_test_repo();
+
+        // Create .gitignore
+        write_test_file(temp.path(), ".gitignore", "*.log\n");
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".gitignore")).unwrap();
+        index.write().unwrap();
+        create_test_commit(&repo, "Add gitignore");
+
+        // Add both tracked and ignored file
+        write_test_file(temp.path(), "tracked.txt", "content");
+        write_test_file(temp.path(), "ignored.log", "log content");
+
+        let repo_config = Repository {
+            path: temp.path().to_path_buf(),
+            auto_commit: true,
+            commit_message_template: "Auto commit".to_owned(),
+        };
+
+        let committed = check_and_commit(&repo_config).await.unwrap();
+        assert!(committed);
+
+        // Verify only tracked file was committed
+        let repo_after = GitRepository::open(temp.path()).unwrap();
+        let head = repo_after.head().unwrap();
+        let commit = repo_after.find_commit(head.target().unwrap()).unwrap();
+        let tree = commit.tree().unwrap();
+
+        assert!(tree.get_name("tracked.txt").is_some());
+        assert!(tree.get_name("ignored.log").is_none());
+    }
 }
