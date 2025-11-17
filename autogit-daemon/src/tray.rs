@@ -110,6 +110,11 @@ impl Tray for AutogitTray {
         env!("CARGO_PKG_NAME").to_owned()
     }
 
+    fn activate(&mut self, _x: i32, _y: i32) {
+        // Left-click on tray icon - could trigger sync or show status
+        info!("Tray icon clicked");
+    }
+
     fn category(&self) -> ksni::Category {
         // Use ApplicationStatus to prevent theme coloring
         ksni::Category::ApplicationStatus
@@ -130,14 +135,14 @@ impl Tray for AutogitTray {
         }
     }
 
-    fn icon_name(&self) -> String {
-        // Return empty string to force use of icon_pixmap (custom PNG icons)
-        // If we return icon names, KDE will prefer theme icons over our custom ones
+    fn icon_theme_path(&self) -> String {
+        // Provide fallback icon theme path
         String::new()
     }
 
-    fn icon_theme_path(&self) -> String {
-        // Provide fallback icon theme path
+    fn icon_name(&self) -> String {
+        // Return empty string to force use of icon_pixmap (custom PNG icons)
+        // If we return icon names, KDE will prefer theme icons over our custom ones
         String::new()
     }
 
@@ -263,11 +268,6 @@ impl Tray for AutogitTray {
                 ..Default::default()
             }.into(),
         ]
-    }
-
-    fn activate(&mut self, _x: i32, _y: i32) {
-        // Left-click on tray icon - could trigger sync or show status
-        info!("Tray icon clicked");
     }
 }
 

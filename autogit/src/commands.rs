@@ -104,8 +104,8 @@ pub fn list_repositories() -> Result<()> {
     let mut table = Table::new(rows);
     table
         .with(Style::rounded())
-        .with(Modify::new(Columns::single(0)).with(Width::truncate(11).suffix("")))
-        .with(Modify::new(Columns::new(1..)).with(Width::wrap(60).keep_words()));
+        .with(Modify::new(Columns::new(0..1)).with(Width::truncate(11).suffix("")))
+        .with(Modify::new(Columns::new(1..)).with(Width::wrap(60).keep_words(true)));
 
     println!("{}", table);
 
@@ -674,7 +674,7 @@ mod tests {
 
         let config = Config::load_or_create_default().unwrap();
         assert_eq!(config.repositories.len(), 1);
-        assert!(config.repositories[0].path == repo2.path().canonicalize().unwrap());
+        assert_eq!(config.repositories[0].path, repo2.path().canonicalize().unwrap());
     }
 
     #[test]

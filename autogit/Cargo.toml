@@ -21,10 +21,10 @@ clap.workspace = true
 dialoguer.workspace = true
 
 # For colored output
-colored = "2.1"
+colored = "3.0.0"
 
 # Table formatting
-tabled = "0.15"
+tabled = "0.20.0"
 
 [dev-dependencies]
 tempfile = "3.8"

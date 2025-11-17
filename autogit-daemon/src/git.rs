@@ -28,7 +28,7 @@ fn open_repository(path: &Path) -> Result<GitRepository> {
 
 /// Push commits to remote
 /// Returns true if push was successful, false if skipped or failed
-fn push_changes(repo: &GitRepository, repo_path: &std::path::Path) -> Result<bool> {
+fn push_changes(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
     // Check if remote exists
     let has_remote = match repo.find_remote("origin") {
         Ok(_) => true,
@@ -111,7 +111,7 @@ fn push_changes(repo: &GitRepository, repo_path: &std::path::Path) -> Result<boo
 
 /// Pull and rebase from remote
 /// Returns true if pull was successful, false if skipped or failed
-fn pull_rebase(repo: &GitRepository, repo_path: &std::path::Path) -> Result<bool> {
+fn pull_rebase(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
     // Check if remote exists
     let has_remote = match repo.find_remote("origin") {
         Ok(_) => true,
@@ -420,7 +420,7 @@ mod tests {
         let message = format_commit_message(template);
 
         // Should match format: YYYY-MM-DD HH:MM:SS
-        assert!(message.len() == 19); // "2025-11-15 20:30:45" format
+        assert_eq!(message.len(), 19); // "2025-11-15 20:30:45" format
         assert!(message.contains('-'));
         assert!(message.contains(':'));
         assert!(message.contains(' '));
@@ -432,7 +432,7 @@ mod tests {
         let message = format_commit_message(template);
 
         // Should match format: YYYY-MM-DD
-        assert!(message.len() == 10);
+        assert_eq!(message.len(), 10);
         assert_eq!(message.chars().filter(|&c| c == '-').count(), 2);
     }
 
@@ -442,7 +442,7 @@ mod tests {
         let message = format_commit_message(template);
 
         // Should match format: HH:MM:SS
-        assert!(message.len() == 8);
+        assert_eq!(message.len(), 8);
         assert_eq!(message.chars().filter(|&c| c == ':').count(), 2);
     }
 
@@ -531,7 +531,7 @@ mod tests {
         let message2 = format_commit_message(template);
 
         // Messages should be close in time (format is stable)
-        assert!(message1.len() == message2.len());
+        assert_eq!(message1.len(), message2.len());
     }
 
     #[test]
