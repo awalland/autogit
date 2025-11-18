@@ -93,7 +93,11 @@ async fn main() -> Result<()> {
     // Check if tray is enabled in config
     let enable_tray = config.read().await.daemon.enable_tray;
     let initial_tray = if enable_tray {
-        let repo_count = config.read().await.repositories.len();
+        let cfg = config.read().await;
+        let repo_count = cfg.repositories.len();
+        let check_interval = cfg.daemon.check_interval_seconds;
+        drop(cfg);
+
         let tray = tray::AutogitTray::new(repo_count, tray_action_tx.clone(), suspended.clone());
         match tray.spawn_tray().await {
             Ok(handle) => {
@@ -102,7 +106,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!("Failed to spawn system tray icon (no desktop environment?): {:#}", e);
-                warn!("Daemon will continue without tray icon");
+                warn!("Will retry tray initialization up to 3 times (every {} seconds)", check_interval);
                 None
             }
         }
