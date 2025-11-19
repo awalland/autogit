@@ -41,6 +41,9 @@ ksni = "0.3"
 # Image decoding for tray icons
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Path manipulation
+dirs = "6.0.0"
+
 [dev-dependencies]
 tempfile = "3.8"
 serial_test = "3.0"
