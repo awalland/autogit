@@ -185,7 +185,7 @@ systemctl --user start autogit-daemon
 systemctl --user status autogit-daemon
 
 # View logs
-journalctl --user -u autogit-daemon -f
+journalctl --user-unit=autogit-daemon -f
 ```
 
 
