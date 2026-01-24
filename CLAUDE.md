@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Code Style Conventions
 
-- **String conversions**: Use `.to_owned()` instead of `.to_string()` when converting `&str` or string slices to `String`. Reserve `.to_string()` for types that implement `Display` trait (like integers, floats, `Path::display()`, format results, etc.)
+- **Ownership vs conversion**: Use `.to_owned()` as the primary way to make values owned (e.g., `&str` → `String`). Only use `.to_string()` when the goal is to convert a value to its string representation (e.g., `42.to_string()` or `path.display().to_string()`).
 
 ## Project Overview
 
@@ -77,31 +77,6 @@ Completions are auto-generated during build via `autogit/build.rs`:
 - Uses `clap_complete` to generate bash, zsh, and fish completions
 - Build script copies completions to `autogit/completions/` directory
 - CLI definition is in `autogit/src/cli.rs` (shared with build.rs via `include!`)
-
-## Testing with systemd
-
-```bash
-# Install binaries
-sudo cp target/release/autogit-daemon /usr/bin/
-sudo cp target/release/autogit /usr/bin/
-
-# Copy service file
-mkdir -p ~/.config/systemd/user
-cp autogit-daemon.service ~/.config/systemd/user/
-
-# Essential: Import SSH agent for git operations
-systemctl --user import-environment SSH_AUTH_SOCK
-
-# Start daemon
-systemctl --user daemon-reload
-systemctl --user start autogit-daemon
-
-# View logs
-journalctl --user -u autogit-daemon -f
-
-# After code changes: restart daemon
-systemctl --user restart autogit-daemon
-```
 
 ## Version Management
 
