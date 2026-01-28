@@ -21,14 +21,14 @@ clap.workspace = true
 dialoguer.workspace = true
 
 # For colored output
-colored = "3.0.0"
+colored = "3.1.1"
 
 # Table formatting
 tabled = "0.20.0"
 
 [dev-dependencies]
-tempfile = "3.8"
-serial_test = "3.0"
+tempfile = "3.24"
+serial_test = "3.3"
 
 [build-dependencies]
 clap = { workspace = true }
