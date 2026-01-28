@@ -191,7 +191,7 @@ journalctl --user-unit=autogit-daemon -f
 
 ## Requirements
 
-- Rust 1.70 or later
+- Rust 1.85 or later
 - Git (with `user.name` and `user.email` configured)
 - Linux (for systemd integration)
 
