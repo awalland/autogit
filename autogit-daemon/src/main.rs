@@ -4,13 +4,13 @@ mod tray;
 
 use anyhow::{Context, Result};
 use autogit_shared::Config;
-use notify::{Watcher, RecursiveMode, Event};
+use notify::{Event, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, mpsc};
-use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,22 +18,23 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
     info!("Starting autogit-daemon v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
-    let config_path = Config::default_config_path()
-        .context("Failed to get default config path")?;
+    let config_path = Config::default_config_path().context("Failed to get default config path")?;
 
     info!("Loading configuration from: {}", config_path.display());
 
-    let config = Config::load_or_create_default()
-        .context("Failed to load configuration")?;
+    let config = Config::load_or_create_default().context("Failed to load configuration")?;
 
-    info!("Loaded configuration with {} repositories", config.repositories.len());
+    info!(
+        "Loaded configuration with {} repositories",
+        config.repositories.len()
+    );
 
     // Initialize all repositories (commit pending changes and pull)
     info!("Initializing repositories...");
@@ -48,13 +49,17 @@ async fn main() -> Result<()> {
                 info!("Initialized repository: {}", repo.path.display());
                 initial_repo_details.push(autogit_shared::protocol::RepoDetail {
                     path: repo.path.clone(),
-                    committed: false,  // Initialization doesn't track if commit happened
+                    committed: false, // Initialization doesn't track if commit happened
                     files_changed: None,
                     error: None,
                 });
             }
             Err(e) => {
-                error!("Error initializing repository {}: {:#}", repo.path.display(), e);
+                error!(
+                    "Error initializing repository {}: {:#}",
+                    repo.path.display(),
+                    e
+                );
                 initial_repo_details.push(autogit_shared::protocol::RepoDetail {
                     path: repo.path.clone(),
                     committed: false,
@@ -90,14 +95,18 @@ async fn main() -> Result<()> {
     .context("Failed to create config file watcher")?;
 
     // Watch the config file
-    watcher.watch(&config_path, RecursiveMode::NonRecursive)
+    watcher
+        .watch(&config_path, RecursiveMode::NonRecursive)
         .with_context(|| format!("Failed to watch config file: {}", config_path.display()))?;
 
-    info!("Watching config file for changes: {}", config_path.display());
+    info!(
+        "Watching config file for changes: {}",
+        config_path.display()
+    );
 
     // Set up Unix socket for CLI communication
-    let socket_listener = socket::create_listener()
-        .context("Failed to create Unix socket listener")?;
+    let socket_listener =
+        socket::create_listener().context("Failed to create Unix socket listener")?;
 
     // Set up system tray icon with suspended state (optional - won't fail if no tray available)
     let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -122,8 +131,14 @@ async fn main() -> Result<()> {
                 Some(handle)
             }
             Err(e) => {
-                warn!("Failed to spawn system tray icon (no desktop environment?): {:#}", e);
-                warn!("Will retry tray initialization up to 3 times (every {} seconds)", check_interval);
+                warn!(
+                    "Failed to spawn system tray icon (no desktop environment?): {:#}",
+                    e
+                );
+                warn!(
+                    "Will retry tray initialization up to 3 times (every {} seconds)",
+                    check_interval
+                );
                 None
             }
         }
@@ -134,22 +149,24 @@ async fn main() -> Result<()> {
 
     // Track tray initialization retry attempts
     let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(
-        if enable_tray && initial_tray.is_none() { 0 } else { 3 }
+        if enable_tray && initial_tray.is_none() {
+            0
+        } else {
+            3
+        },
     ));
 
     let tray_handle = Arc::new(RwLock::new(initial_tray));
 
     // Set up signal handling for graceful shutdown
-    let sigterm = signal(SignalKind::terminate())
-        .context("Failed to create SIGTERM handler")?;
-    let sigint = signal(SignalKind::interrupt())
-        .context("Failed to create SIGINT handler")?;
+    let sigterm = signal(SignalKind::terminate()).context("Failed to create SIGTERM handler")?;
+    let sigint = signal(SignalKind::interrupt()).context("Failed to create SIGINT handler")?;
 
     // Track daemon start time for uptime reporting
     let start_time = Instant::now();
 
     // Start the main daemon loop
-    run_daemon(
+    run_daemon(RunDaemonArgs {
         config,
         config_path_clone,
         reload_rx,
@@ -162,7 +179,8 @@ async fn main() -> Result<()> {
         suspended,
         tray_action_tx,
         tray_retry_count,
-    ).await?;
+    })
+    .await?;
 
     // Keep watcher alive until daemon exits
     drop(watcher);
@@ -174,24 +192,41 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run_daemon(
-    config: Arc<RwLock<Config>>,
-    config_path: PathBuf,
-    mut reload_rx: mpsc::Receiver<()>,
-    mut sigterm: tokio::signal::unix::Signal,
-    mut sigint: tokio::signal::unix::Signal,
-    socket_listener: tokio::net::UnixListener,
-    start_time: Instant,
-    tray_handle: Arc<RwLock<Option<ksni::Handle<tray::AutogitTray>>>>,
-    mut tray_action_rx: mpsc::Receiver<tray::TrayAction>,
-    suspended: Arc<std::sync::atomic::AtomicBool>,
-    tray_action_tx: mpsc::Sender<tray::TrayAction>,
-    tray_retry_count: Arc<std::sync::atomic::AtomicU8>,
-) -> Result<()> {
+pub(crate) struct RunDaemonArgs {
+    pub(crate) config: Arc<RwLock<Config>>,
+    pub(crate) config_path_clone: PathBuf,
+    pub(crate) reload_rx: mpsc::Receiver<()>,
+    pub(crate) sigterm: tokio::signal::unix::Signal,
+    pub(crate) sigint: tokio::signal::unix::Signal,
+    pub(crate) socket_listener: tokio::net::UnixListener,
+    pub(crate) start_time: Instant,
+    pub(crate) tray_handle: Arc<RwLock<Option<ksni::Handle<tray::AutogitTray>>>>,
+    pub(crate) tray_action_rx: mpsc::Receiver<tray::TrayAction>,
+    pub(crate) suspended: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) tray_action_tx: mpsc::Sender<tray::TrayAction>,
+    pub(crate) tray_retry_count: Arc<std::sync::atomic::AtomicU8>,
+}
+
+pub(crate) async fn run_daemon(args: RunDaemonArgs) -> Result<()> {
+    let RunDaemonArgs {
+        config,
+        config_path_clone: config_path,
+        mut reload_rx,
+        mut sigterm,
+        mut sigint,
+        socket_listener,
+        start_time,
+        tray_handle,
+        mut tray_action_rx,
+        suspended,
+        tray_action_tx,
+        tray_retry_count,
+    } = args;
+
     let mut interval = {
         let cfg = config.read().await;
         tokio::time::interval(std::time::Duration::from_secs(
-            cfg.daemon.check_interval_seconds
+            cfg.daemon.check_interval_seconds,
         ))
     };
 
@@ -262,9 +297,9 @@ pub(crate) async fn run_daemon(
                 }
 
                 // Normal check cycle
-                if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                if let Some(tray) = tray_handle.read().await.as_ref() {
                     tray.update(|t| {
-                        let _ = t.set_status(tray::TrayStatus::Syncing);
+                        t.set_status(tray::TrayStatus::Syncing);
                     }).await;
                 }
 
@@ -304,18 +339,18 @@ pub(crate) async fn run_daemon(
                 }
 
                 // Update tray status and repository details
-                if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                if let Some(tray) = tray_handle.read().await.as_ref() {
                     tray.update(|t| {
-                        let _ = t.update_repo_details(repo_details.clone());
+                        t.update_repo_details(repo_details.clone());
                     }).await;
 
                     if any_errors {
                         tray.update(|t| {
-                            let _ = t.increment_errors();
+                            t.increment_errors();
                         }).await;
                     } else {
                         tray.update(|t| {
-                            let _ = t.set_last_sync();
+                            t.set_last_sync();
                         }).await;
                     }
                 }
@@ -371,15 +406,15 @@ pub(crate) async fn run_daemon(
                         info!("Configuration reloaded successfully with {} repositories", new_repo_count);
 
                         // Update tray with new repository count and interval
-                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                        if let Some(tray) = tray_handle.read().await.as_ref() {
                             tray.update(|t| {
-                                let _ = t.set_repo_count(new_repo_count);
+                                t.set_repo_count(new_repo_count);
                             }).await;
 
                             // Update check interval in tray if changed
                             if old_interval != new_interval {
                                 tray.update(|t| {
-                                    let _ = t.set_check_interval(new_interval);
+                                    t.set_check_interval(new_interval);
                                 }).await;
                             }
                         }
@@ -439,9 +474,9 @@ pub(crate) async fn run_daemon(
                         }
 
                         info!("Manual sync triggered from tray icon");
-                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                        if let Some(tray) = tray_handle.read().await.as_ref() {
                             tray.update(|t| {
-                                let _ = t.set_status(tray::TrayStatus::Syncing);
+                                t.set_status(tray::TrayStatus::Syncing);
                             }).await;
                         }
 
@@ -466,14 +501,14 @@ pub(crate) async fn run_daemon(
                             }
                         }
 
-                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                        if let Some(tray) = tray_handle.read().await.as_ref() {
                             if any_errors {
                                 tray.update(|t| {
-                                    let _ = t.increment_errors();
+                                    t.increment_errors();
                                 }).await;
                             } else {
                                 tray.update(|t| {
-                                    let _ = t.set_last_sync();
+                                    t.set_last_sync();
                                 }).await;
                             }
                         }
@@ -490,7 +525,7 @@ pub(crate) async fn run_daemon(
                         }
 
                         // Update tray to reflect new state
-                        if let Some(ref tray) = tray_handle.read().await.as_ref() {
+                        if let Some(tray) = tray_handle.read().await.as_ref() {
                             tray.update(|_t| {}).await;
                         }
                     }
@@ -510,18 +545,18 @@ pub(crate) async fn run_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autogit_shared::test_support::set_env_var;
     use autogit_shared::{Config, DaemonConfig, Repository};
-    use std::env;
+    use serial_test::serial;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
-    use serial_test::serial;
 
     // Helper to create a test config
     fn create_test_config() -> Config {
         Config {
             daemon: DaemonConfig {
                 check_interval_seconds: 1, // Short interval for testing
-                enable_tray: false, // Disable tray in tests
+                enable_tray: false,        // Disable tray in tests
             },
             repositories: vec![],
         }
@@ -537,10 +572,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_config_reload_updates_interval() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create initial config
         let config_path = Config::default_config_path().unwrap();
@@ -570,8 +605,8 @@ mod tests {
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -583,7 +618,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to start
@@ -622,10 +658,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_config_reload_adds_repositories() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create initial config with no repos
         let config_path = Config::default_config_path().unwrap();
@@ -653,8 +689,8 @@ mod tests {
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -666,7 +702,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to start
@@ -716,10 +753,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_config_reload_handles_invalid_config() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create initial config
         let config_path = Config::default_config_path().unwrap();
@@ -748,8 +785,8 @@ mod tests {
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -761,7 +798,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to start
@@ -792,10 +830,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_config_reload_only_initializes_new_repos() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create initial config with one repo
         let config_path = Config::default_config_path().unwrap();
@@ -828,8 +866,8 @@ mod tests {
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -841,7 +879,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to start
@@ -885,10 +924,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_daemon_respects_short_check_interval() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create config with very short interval
         let config_path = Config::default_config_path().unwrap();
@@ -917,8 +956,8 @@ mod tests {
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -930,7 +969,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Let it run for a bit
@@ -949,10 +989,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_config_reload_skips_disabled_repos() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create initial config
         let config_path = Config::default_config_path().unwrap();
@@ -980,8 +1020,8 @@ mod tests {
 
         // Spawn daemon in background
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -993,7 +1033,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to start
@@ -1019,7 +1060,7 @@ mod tests {
         {
             let cfg = config.read().await;
             assert_eq!(cfg.repositories.len(), 1);
-            assert_eq!(cfg.repositories[0].auto_commit, false);
+            assert!(!cfg.repositories[0].auto_commit);
         }
 
         // Shutdown daemon
@@ -1032,10 +1073,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_action_trigger_sync() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let config = create_test_config();
@@ -1059,8 +1100,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1070,15 +1111,19 @@ mod tests {
                 tray_handle,
                 tray_action_rx,
                 suspended,
-                tray_action_tx_clone,
+                tray_action_tx: tray_action_tx_clone,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Send TriggerSync action
-        tray_action_tx.send(tray::TrayAction::TriggerSync).await.unwrap();
+        tray_action_tx
+            .send(tray::TrayAction::TriggerSync)
+            .await
+            .unwrap();
 
         // Give time for action to be processed
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -1093,10 +1138,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_action_toggle_suspend() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let config = create_test_config();
@@ -1121,8 +1166,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1132,9 +1177,10 @@ mod tests {
                 tray_handle,
                 tray_action_rx,
                 suspended,
-                tray_action_tx_clone,
+                tray_action_tx: tray_action_tx_clone,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1143,7 +1189,10 @@ mod tests {
         assert!(!suspended_clone.load(std::sync::atomic::Ordering::Relaxed));
 
         // Send ToggleSuspend action
-        tray_action_tx.send(tray::TrayAction::ToggleSuspend).await.unwrap();
+        tray_action_tx
+            .send(tray::TrayAction::ToggleSuspend)
+            .await
+            .unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -1157,10 +1206,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_action_quit() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let config = create_test_config();
@@ -1184,8 +1233,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            run_daemon(
-                config_clone,
+            run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1195,9 +1244,10 @@ mod tests {
                 tray_handle,
                 tray_action_rx,
                 suspended,
-                tray_action_tx_clone,
+                tray_action_tx: tray_action_tx_clone,
                 tray_retry_count,
-            ).await
+            })
+            .await
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1217,10 +1267,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_trigger_sync_when_suspended() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let config = create_test_config();
@@ -1244,8 +1294,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1255,15 +1305,19 @@ mod tests {
                 tray_handle,
                 tray_action_rx,
                 suspended,
-                tray_action_tx_clone,
+                tray_action_tx: tray_action_tx_clone,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Try to trigger sync while suspended (should be skipped)
-        tray_action_tx.send(tray::TrayAction::TriggerSync).await.unwrap();
+        tray_action_tx
+            .send(tray::TrayAction::TriggerSync)
+            .await
+            .unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -1277,10 +1331,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_interval_tick_when_suspended() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let mut config = create_test_config();
@@ -1305,8 +1359,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1318,7 +1372,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Let it run for multiple intervals while suspended
@@ -1334,10 +1389,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_enable_disable_via_config_reload() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let mut config = create_test_config();
@@ -1362,8 +1417,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1375,7 +1430,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1403,10 +1459,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_retry_logic() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let mut config = create_test_config();
@@ -1435,8 +1491,8 @@ mod tests {
         let tray_retry_count_clone = Arc::clone(&tray_retry_count);
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1448,13 +1504,17 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Initial retry count should be 0
-        assert_eq!(tray_retry_count_clone.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            tray_retry_count_clone.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
         // Wait for at least one interval tick (retry attempt)
         // The daemon will try to initialize tray and increment counter
@@ -1463,8 +1523,16 @@ mod tests {
         // After interval ticks, retry count should have incremented
         // (it may not succeed in test env, but counter should increment)
         let retry_count = tray_retry_count_clone.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(retry_count > 0, "Retry count should have incremented, got {}", retry_count);
-        assert!(retry_count <= 3, "Retry count should not exceed 3, got {}", retry_count);
+        assert!(
+            retry_count > 0,
+            "Retry count should have incremented, got {}",
+            retry_count
+        );
+        assert!(
+            retry_count <= 3,
+            "Retry count should not exceed 3, got {}",
+            retry_count
+        );
 
         daemon_handle.abort();
         let _ = std::fs::remove_file(&config_path);
@@ -1473,10 +1541,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_initialized_with_repo_details() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let mut config = create_test_config();
@@ -1503,8 +1571,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1516,7 +1584,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to initialize (tray may fail in test env, that's ok)
@@ -1539,10 +1608,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_tray_updates_on_sync_cycle() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let mut config = create_test_config();
@@ -1568,8 +1637,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1581,7 +1650,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Wait for at least one sync cycle
@@ -1597,10 +1667,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_check_interval_set_on_tray() {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let config_path = Config::default_config_path().unwrap();
         let mut config = create_test_config();
@@ -1626,8 +1696,8 @@ mod tests {
         let tray_retry_count = Arc::new(std::sync::atomic::AtomicU8::new(3));
 
         let daemon_handle = tokio::spawn(async move {
-            let _ = run_daemon(
-                config_clone,
+            let _ = run_daemon(RunDaemonArgs {
+                config: config_clone,
                 config_path_clone,
                 reload_rx,
                 sigterm,
@@ -1639,7 +1709,8 @@ mod tests {
                 suspended,
                 tray_action_tx,
                 tray_retry_count,
-            ).await;
+            })
+            .await;
         });
 
         // Give daemon time to initialize

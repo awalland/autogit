@@ -30,20 +30,20 @@ notify.workspace = true
 tokio.workspace = true
 
 # Time handling
-chrono = "0.4"
+chrono = "0.4.44"
 
 # Desktop notifications
-notify-rust = "4"
+notify-rust = "4.17"
 
 # System tray
-ksni = "0.3"
+ksni = "0.3.4"
 
 # Image decoding for tray icons
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Path manipulation
-dirs = "6.0.0"
+dirs.workspace = true
 
 [dev-dependencies]
-tempfile = "3.24"
-serial_test = "3.3"
+tempfile.workspace = true
+serial_test.workspace = true

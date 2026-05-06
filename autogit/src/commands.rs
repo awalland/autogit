@@ -1,8 +1,14 @@
 use anyhow::{Context, Result, bail};
-use autogit_shared::{Config, Repository, Command as DaemonCommand, Response, ResponseStatus, ResponseData, socket_path};
+use autogit_shared::{
+    Command as DaemonCommand, Config, Repository, Response, ResponseData, ResponseStatus,
+    socket_path,
+};
 use colored::Colorize;
 use std::path::PathBuf;
-use tabled::{Table, Tabled, settings::{Style, Width, Modify, object::Columns}};
+use tabled::{
+    Table, Tabled,
+    settings::{Modify, Style, Width, object::Columns},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -40,9 +46,20 @@ pub fn add_repository(path: &str, message: Option<String>, interval: Option<u64>
 
     config.save(&config_path)?;
 
-    println!("{} Added repository: {}", "✓".green().bold(), repo_path.display());
-    println!("{} Configuration saved to: {}", "→".blue(), config_path.display());
-    println!("{} Changes will be applied automatically (daemon auto-reloads config)", "→".green());
+    println!(
+        "{} Added repository: {}",
+        "✓".green().bold(),
+        repo_path.display()
+    );
+    println!(
+        "{} Configuration saved to: {}",
+        "→".blue(),
+        config_path.display()
+    );
+    println!(
+        "{} Changes will be applied automatically (daemon auto-reloads config)",
+        "→".green()
+    );
 
     Ok(())
 }
@@ -58,13 +75,23 @@ pub fn remove_repository(path: &str) -> Result<()> {
     config.repositories.retain(|r| r.path != repo_path);
 
     if config.repositories.len() == original_len {
-        bail!("Repository not found in configuration: {}", repo_path.display());
+        bail!(
+            "Repository not found in configuration: {}",
+            repo_path.display()
+        );
     }
 
     config.save(&config_path)?;
 
-    println!("{} Removed repository: {}", "✓".green().bold(), repo_path.display());
-    println!("{} Changes will be applied automatically (daemon auto-reloads config)", "→".green());
+    println!(
+        "{} Removed repository: {}",
+        "✓".green().bold(),
+        repo_path.display()
+    );
+    println!(
+        "{} Changes will be applied automatically (daemon auto-reloads config)",
+        "→".green()
+    );
 
     Ok(())
 }
@@ -89,8 +116,10 @@ pub fn list_repositories() -> Result<()> {
         message: String,
     }
 
-    let rows: Vec<RepoRow> = config.repositories.iter().map(|r| {
-        RepoRow {
+    let rows: Vec<RepoRow> = config
+        .repositories
+        .iter()
+        .map(|r| RepoRow {
             status: if r.auto_commit {
                 "✓ Enabled".to_owned()
             } else {
@@ -98,8 +127,8 @@ pub fn list_repositories() -> Result<()> {
             },
             path: r.path.display().to_string(),
             message: r.commit_message_template.clone(),
-        }
-    }).collect();
+        })
+        .collect();
 
     let mut table = Table::new(rows);
     table
@@ -109,7 +138,11 @@ pub fn list_repositories() -> Result<()> {
 
     println!("{}", table);
 
-    println!("\n{} Check interval: {} seconds", "→".blue(), config.daemon.check_interval_seconds);
+    println!(
+        "\n{} Check interval: {} seconds",
+        "→".blue(),
+        config.daemon.check_interval_seconds
+    );
 
     Ok(())
 }
@@ -130,7 +163,9 @@ fn update_repository_status(path: &str, enabled: bool) -> Result<()> {
 
     let repo_path = expand_path(path)?;
 
-    let repo = config.repositories.iter_mut()
+    let repo = config
+        .repositories
+        .iter_mut()
         .find(|r| r.path == repo_path)
         .with_context(|| format!("Repository not found: {}", repo_path.display()))?;
 
@@ -138,8 +173,16 @@ fn update_repository_status(path: &str, enabled: bool) -> Result<()> {
     config.save(&config_path)?;
 
     let status = if enabled { "enabled" } else { "disabled" };
-    println!("{} Auto-commit {} for: {}", "✓".green().bold(), status, repo_path.display());
-    println!("{} Changes will be applied automatically (daemon auto-reloads config)", "→".green());
+    println!(
+        "{} Auto-commit {} for: {}",
+        "✓".green().bold(),
+        status,
+        repo_path.display()
+    );
+    println!(
+        "{} Changes will be applied automatically (daemon auto-reloads config)",
+        "→".green()
+    );
 
     Ok(())
 }
@@ -156,8 +199,15 @@ pub fn set_interval(seconds: Option<u64>) -> Result<()> {
             config.daemon.check_interval_seconds = secs;
             config.save(&config_path)?;
 
-            println!("{} Check interval set to {} seconds", "✓".green().bold(), secs);
-            println!("{} Changes will be applied automatically (daemon auto-reloads config)", "→".green());
+            println!(
+                "{} Check interval set to {} seconds",
+                "✓".green().bold(),
+                secs
+            );
+            println!(
+                "{} Changes will be applied automatically (daemon auto-reloads config)",
+                "→".green()
+            );
         }
         None => {
             // Show current interval
@@ -169,11 +219,22 @@ pub fn set_interval(seconds: Option<u64>) -> Result<()> {
                 let minutes = current / 60;
                 let remaining_seconds = current % 60;
                 if remaining_seconds == 0 {
-                    println!("   ({})", format!("{} minute{}", minutes, if minutes != 1 { "s" } else { "" }).cyan());
+                    println!(
+                        "   ({})",
+                        format!("{} minute{}", minutes, if minutes != 1 { "s" } else { "" }).cyan()
+                    );
                 } else {
-                    println!("   ({})", format!("{} minute{} {} second{}",
-                        minutes, if minutes != 1 { "s" } else { "" },
-                        remaining_seconds, if remaining_seconds != 1 { "s" } else { "" }).cyan());
+                    println!(
+                        "   ({})",
+                        format!(
+                            "{} minute{} {} second{}",
+                            minutes,
+                            if minutes != 1 { "s" } else { "" },
+                            remaining_seconds,
+                            if remaining_seconds != 1 { "s" } else { "" }
+                        )
+                        .cyan()
+                    );
                 }
             }
         }
@@ -202,7 +263,11 @@ pub async fn show_status() -> Result<()> {
     }
 
     println!("{} Config file: {}", "→".blue(), config_path.display());
-    println!("{} Check interval: {} seconds", "→".blue(), config.daemon.check_interval_seconds);
+    println!(
+        "{} Check interval: {} seconds",
+        "→".blue(),
+        config.daemon.check_interval_seconds
+    );
     println!("{} Repositories: {}", "→".blue(), config.repositories.len());
 
     if !config.repositories.is_empty() {
@@ -227,8 +292,7 @@ pub fn edit_config() -> Result<()> {
     // Ensure config exists
     let _ = Config::load_or_create_default()?;
 
-    let editor = std::env::var("EDITOR")
-        .unwrap_or_else(|_| "vi".to_owned());
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
 
     println!("Opening {} in {}...", config_path.display(), editor);
 
@@ -237,14 +301,20 @@ pub fn edit_config() -> Result<()> {
         .status()
         .context("Failed to open editor")?;
 
-    println!("{} Changes will be applied automatically (daemon auto-reloads config)", "→".green());
+    println!(
+        "{} Changes will be applied automatically (daemon auto-reloads config)",
+        "→".green()
+    );
 
     Ok(())
 }
 
 /// Trigger an immediate check and commit cycle
 pub async fn trigger_now() -> Result<()> {
-    println!("{} Triggering immediate check and commit cycle...", "→".blue());
+    println!(
+        "{} Triggering immediate check and commit cycle...",
+        "→".blue()
+    );
 
     // Send trigger command to daemon
     let response = send_daemon_command(DaemonCommand::Trigger).await?;
@@ -257,7 +327,12 @@ pub async fn trigger_now() -> Result<()> {
     println!("{} {}", "✓".green().bold(), response.message);
 
     // Display detailed results if available
-    if let Some(ResponseData::Trigger { repos_checked, repos_committed, details }) = response.data {
+    if let Some(ResponseData::Trigger {
+        repos_checked,
+        repos_committed,
+        details,
+    }) = response.data
+    {
         if !details.is_empty() {
             println!("\n{}", "Results:".bold());
             for detail in details {
@@ -271,10 +346,10 @@ pub async fn trigger_now() -> Result<()> {
 
                 print!("  {} {}", icon, detail.path.display());
 
-                if let Some(files) = detail.files_changed {
-                    if files > 0 {
-                        print!(" ({} files)", files);
-                    }
+                if let Some(files) = detail.files_changed
+                    && files > 0
+                {
+                    print!(" ({} files)", files);
                 }
 
                 if let Some(ref error) = detail.error {
@@ -330,21 +405,20 @@ pub async fn resume_daemon() -> Result<()> {
 /// Expand ~ and canonicalize path
 fn expand_path(path: &str) -> Result<PathBuf> {
     let expanded = if path.starts_with("~/") {
-        let home = std::env::var("HOME")
-            .context("HOME environment variable not set")?;
+        let home = std::env::var("HOME").context("HOME environment variable not set")?;
         PathBuf::from(path.replacen("~/", &format!("{}/", home), 1))
     } else {
         PathBuf::from(path)
     };
 
-    expanded.canonicalize()
+    expanded
+        .canonicalize()
         .with_context(|| format!("Failed to resolve path: {}", path))
 }
 
 /// Send a command to the daemon via Unix socket and get response
 async fn send_daemon_command(command: DaemonCommand) -> Result<Response> {
-    let socket_path = socket_path()
-        .context("Failed to get socket path")?;
+    let socket_path = socket_path().context("Failed to get socket path")?;
 
     // Try to connect to the socket
     let stream = UnixStream::connect(&socket_path).await
@@ -354,33 +428,36 @@ async fn send_daemon_command(command: DaemonCommand) -> Result<Response> {
         ))?;
 
     // Send command
-    let command_json = command.to_json()
-        .context("Failed to serialize command")?;
+    let command_json = command.to_json().context("Failed to serialize command")?;
 
     let mut stream = stream;
-    stream.write_all(command_json.as_bytes()).await
+    stream
+        .write_all(command_json.as_bytes())
+        .await
         .context("Failed to send command to daemon")?;
 
-    stream.flush().await
-        .context("Failed to flush socket")?;
+    stream.flush().await.context("Failed to flush socket")?;
 
     // Shutdown write side to signal we're done sending
-    stream.shutdown().await
+    stream
+        .shutdown()
+        .await
         .context("Failed to shutdown write side of socket")?;
 
     // Read response
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
 
-    reader.read_line(&mut line).await
+    reader
+        .read_line(&mut line)
+        .await
         .context("Failed to read response from daemon")?;
 
     if line.is_empty() {
         bail!("Daemon closed connection without sending response");
     }
 
-    Response::from_json(&line)
-        .context("Failed to parse daemon response")
+    Response::from_json(&line).context("Failed to parse daemon response")
 }
 
 /// Check if daemon is running by trying to ping it
@@ -391,10 +468,10 @@ async fn is_daemon_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::env;
-    use tempfile::TempDir;
+    use autogit_shared::test_support::set_env_var;
     use serial_test::serial;
+    use std::fs;
+    use tempfile::TempDir;
 
     /// Helper to create a temporary git repository
     fn create_temp_git_repo() -> Result<TempDir> {
@@ -410,7 +487,7 @@ mod tests {
         let repo_dir = create_temp_git_repo()?;
 
         // Set XDG_CONFIG_HOME to our temp directory
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         Ok((config_dir, repo_dir))
     }
@@ -418,10 +495,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_expand_path_absolute() {
-        let _path = "/tmp/test";
-        // expand_path is private, but we can test it indirectly
-        // Just documenting the behavior here
-        assert!(true); // Placeholder
+        assert_eq!(
+            expand_path("/tmp").unwrap(),
+            PathBuf::from("/tmp").canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -437,8 +514,14 @@ mod tests {
         // Verify config was created
         let config = Config::load_or_create_default().unwrap();
         assert_eq!(config.repositories.len(), 1);
-        assert!(config.repositories[0].path.to_str().unwrap().contains("tmp"));
-        assert_eq!(config.repositories[0].auto_commit, true);
+        assert!(
+            config.repositories[0]
+                .path
+                .to_str()
+                .unwrap()
+                .contains("tmp")
+        );
+        assert!(config.repositories[0].auto_commit);
 
         drop(config_dir);
     }
@@ -453,7 +536,10 @@ mod tests {
         assert!(result.is_ok());
 
         let config = Config::load_or_create_default().unwrap();
-        assert_eq!(config.repositories[0].commit_message_template, "Custom: {date}");
+        assert_eq!(
+            config.repositories[0].commit_message_template,
+            "Custom: {date}"
+        );
 
         drop(config_dir);
     }
@@ -477,14 +563,19 @@ mod tests {
     #[serial]
     fn test_add_repository_not_git_repo() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         let non_git_dir = TempDir::new().unwrap();
         let path = non_git_dir.path().to_str().unwrap();
 
         let result = add_repository(path, None, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Not a git repository"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Not a git repository")
+        );
     }
 
     #[test]
@@ -500,7 +591,12 @@ mod tests {
         // Try to add again
         let result2 = add_repository(repo_path, None, None);
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().to_string().contains("already configured"));
+        assert!(
+            result2
+                .unwrap_err()
+                .to_string()
+                .contains("already configured")
+        );
 
         drop(config_dir);
     }
@@ -553,7 +649,7 @@ mod tests {
         assert!(result.is_ok());
 
         let config = Config::load_or_create_default().unwrap();
-        assert_eq!(config.repositories[0].auto_commit, true);
+        assert!(config.repositories[0].auto_commit);
 
         drop(config_dir);
     }
@@ -572,7 +668,7 @@ mod tests {
         assert!(result.is_ok());
 
         let config = Config::load_or_create_default().unwrap();
-        assert_eq!(config.repositories[0].auto_commit, false);
+        assert!(!config.repositories[0].auto_commit);
 
         drop(config_dir);
     }
@@ -594,7 +690,7 @@ mod tests {
     #[serial]
     fn test_set_interval_new_value() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         let result = set_interval(Some(120));
         assert!(result.is_ok());
@@ -607,7 +703,7 @@ mod tests {
     #[serial]
     fn test_set_interval_show_current() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Set a value first
         set_interval(Some(180)).unwrap();
@@ -621,7 +717,7 @@ mod tests {
     #[serial]
     fn test_list_repositories_empty() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         let result = list_repositories();
         assert!(result.is_ok());
@@ -645,13 +741,18 @@ mod tests {
     #[serial]
     fn test_multiple_repositories() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         let repo1 = create_temp_git_repo().unwrap();
         let repo2 = create_temp_git_repo().unwrap();
 
         add_repository(repo1.path().to_str().unwrap(), None, None).unwrap();
-        add_repository(repo2.path().to_str().unwrap(), Some("Custom".to_owned()), None).unwrap();
+        add_repository(
+            repo2.path().to_str().unwrap(),
+            Some("Custom".to_owned()),
+            None,
+        )
+        .unwrap();
 
         let config = Config::load_or_create_default().unwrap();
         assert_eq!(config.repositories.len(), 2);
@@ -662,7 +763,7 @@ mod tests {
     #[serial]
     fn test_remove_one_of_multiple_repositories() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         let repo1 = create_temp_git_repo().unwrap();
         let repo2 = create_temp_git_repo().unwrap();
@@ -674,7 +775,10 @@ mod tests {
 
         let config = Config::load_or_create_default().unwrap();
         assert_eq!(config.repositories.len(), 1);
-        assert_eq!(config.repositories[0].path, repo2.path().canonicalize().unwrap());
+        assert_eq!(
+            config.repositories[0].path,
+            repo2.path().canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -688,12 +792,12 @@ mod tests {
         // Disable
         disable_repository(repo_path).unwrap();
         let config = Config::load_or_create_default().unwrap();
-        assert_eq!(config.repositories[0].auto_commit, false);
+        assert!(!config.repositories[0].auto_commit);
 
         // Enable
         enable_repository(repo_path).unwrap();
         let config = Config::load_or_create_default().unwrap();
-        assert_eq!(config.repositories[0].auto_commit, true);
+        assert!(config.repositories[0].auto_commit);
 
         drop(config_dir);
     }
@@ -752,8 +856,8 @@ mod tests {
         // Verify final state
         let config = Config::load_or_create_default().unwrap();
         assert_eq!(config.repositories.len(), 2);
-        assert_eq!(config.repositories[0].auto_commit, false);
-        assert_eq!(config.repositories[1].auto_commit, true);
+        assert!(!config.repositories[0].auto_commit);
+        assert!(config.repositories[1].auto_commit);
         assert_eq!(config.repositories[0].commit_message_template, "Msg1");
         assert_eq!(config.repositories[1].commit_message_template, "Msg2");
 
@@ -764,7 +868,7 @@ mod tests {
     #[serial]
     async fn test_is_daemon_running_no_socket() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should return false when socket doesn't exist
         let running = is_daemon_running().await;
@@ -777,7 +881,7 @@ mod tests {
     #[serial]
     async fn test_send_daemon_command_no_daemon() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should fail when daemon is not running
         let result = send_daemon_command(DaemonCommand::Ping).await;
@@ -785,7 +889,6 @@ mod tests {
 
         drop(config_dir);
     }
-
 
     #[test]
     #[serial]
@@ -867,7 +970,7 @@ mod tests {
     #[serial]
     fn test_disable_repository_not_found() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         let result = disable_repository("/nonexistent/path");
         assert!(result.is_err());
@@ -881,7 +984,7 @@ mod tests {
     #[serial]
     fn test_set_interval_zero() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should allow setting interval to 0 (though not recommended)
         let result = set_interval(Some(0));
@@ -897,7 +1000,7 @@ mod tests {
     #[serial]
     fn test_set_interval_large_value() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should allow large intervals
         let result = set_interval(Some(86400)); // 24 hours
@@ -913,7 +1016,7 @@ mod tests {
     #[serial]
     fn test_add_repository_preserves_other_repos() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Create two test git repos
         let repo1 = create_temp_git_repo().unwrap();
@@ -943,7 +1046,7 @@ mod tests {
     #[serial]
     fn test_remove_repository_preserves_others() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Create three test git repos
         let repo1 = create_temp_git_repo().unwrap();
@@ -984,7 +1087,10 @@ mod tests {
         add_repository(path, None, None).unwrap();
 
         let config = Config::load_or_create_default().unwrap();
-        assert_eq!(config.repositories[0].commit_message_template, "Auto-commit: {timestamp}");
+        assert_eq!(
+            config.repositories[0].commit_message_template,
+            "Auto-commit: {timestamp}"
+        );
 
         drop(config_dir);
         drop(repo_dir);
@@ -994,7 +1100,7 @@ mod tests {
     #[serial]
     fn test_update_repository_status_not_found() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Try to update non-existent repository
         let result = enable_repository("/nonexistent");
@@ -1009,8 +1115,8 @@ mod tests {
     #[serial]
     fn test_edit_config_creates_config() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
-        env::set_var("EDITOR", "true"); // Use 'true' command which just exits successfully
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("EDITOR", "true"); // Use 'true' command which just exits successfully
 
         // Should create config if it doesn't exist
         let result = edit_config();
@@ -1027,7 +1133,7 @@ mod tests {
     #[serial]
     async fn test_show_status_no_daemon() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should handle daemon not running gracefully
         let result = show_status().await;
@@ -1042,7 +1148,7 @@ mod tests {
     #[serial]
     async fn test_trigger_now_no_daemon() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should fail when daemon is not running
         let result = trigger_now().await;
@@ -1055,7 +1161,7 @@ mod tests {
     #[serial]
     async fn test_suspend_daemon_no_daemon() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should fail when daemon is not running
         let result = suspend_daemon().await;
@@ -1068,7 +1174,7 @@ mod tests {
     #[serial]
     async fn test_resume_daemon_no_daemon() {
         let config_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        set_env_var("XDG_CONFIG_HOME", config_dir.path());
 
         // Should fail when daemon is not running
         let result = resume_daemon().await;

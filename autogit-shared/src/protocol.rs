@@ -1,11 +1,10 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use anyhow::{Context, Result};
 
 /// Get the path to the daemon Unix domain socket
 pub fn socket_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir()
-        .context("Could not determine config directory")?;
+    let config_dir = dirs::config_dir().context("Could not determine config directory")?;
 
     Ok(config_dir.join("autogit").join("daemon.sock"))
 }
@@ -104,32 +103,28 @@ impl Response {
 
     /// Convert response to JSON string (with newline for line-delimited protocol)
     pub fn to_json(&self) -> Result<String> {
-        let mut json = serde_json::to_string(self)
-            .context("Failed to serialize response")?;
+        let mut json = serde_json::to_string(self).context("Failed to serialize response")?;
         json.push('\n');
         Ok(json)
     }
 
     /// Parse response from JSON line
     pub fn from_json(line: &str) -> Result<Self> {
-        serde_json::from_str(line.trim())
-            .context("Failed to parse response")
+        serde_json::from_str(line.trim()).context("Failed to parse response")
     }
 }
 
 impl Command {
     /// Convert command to JSON string (with newline for line-delimited protocol)
     pub fn to_json(&self) -> Result<String> {
-        let mut json = serde_json::to_string(self)
-            .context("Failed to serialize command")?;
+        let mut json = serde_json::to_string(self).context("Failed to serialize command")?;
         json.push('\n');
         Ok(json)
     }
 
     /// Parse command from JSON line
     pub fn from_json(line: &str) -> Result<Self> {
-        serde_json::from_str(line.trim())
-            .context("Failed to parse command")
+        serde_json::from_str(line.trim()).context("Failed to parse command")
     }
 }
 
@@ -145,7 +140,7 @@ mod tests {
 
         let parsed = Command::from_json(&json).unwrap();
         match parsed {
-            Command::Trigger => {},
+            Command::Trigger => {}
             _ => panic!("Expected Trigger command"),
         }
     }
@@ -302,13 +297,18 @@ mod tests {
         let parsed = Response::from_json(&json).unwrap();
 
         assert_eq!(parsed.status, ResponseStatus::Ok);
-        if let Some(ResponseData::Trigger { repos_checked, repos_committed, details }) = parsed.data {
+        if let Some(ResponseData::Trigger {
+            repos_checked,
+            repos_committed,
+            details,
+        }) = parsed.data
+        {
             assert_eq!(repos_checked, 3);
             assert_eq!(repos_committed, 2);
             assert_eq!(details.len(), 3);
-            assert_eq!(details[0].committed, true);
+            assert!(details[0].committed);
             assert_eq!(details[0].files_changed, Some(10));
-            assert_eq!(details[2].committed, false);
+            assert!(!details[2].committed);
         } else {
             panic!("Expected Trigger data");
         }
@@ -326,7 +326,12 @@ mod tests {
         let json = resp.to_json().unwrap();
         let parsed = Response::from_json(&json).unwrap();
 
-        if let Some(ResponseData::Status { uptime_seconds, check_interval_seconds, repositories_count }) = parsed.data {
+        if let Some(ResponseData::Status {
+            uptime_seconds,
+            check_interval_seconds,
+            repositories_count,
+        }) = parsed.data
+        {
             assert_eq!(uptime_seconds, 3600);
             assert_eq!(check_interval_seconds, 300);
             assert_eq!(repositories_count, 5);
@@ -347,7 +352,7 @@ mod tests {
         let json = serde_json::to_string(&detail).unwrap();
         let parsed: RepoDetail = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.committed, false);
+        assert!(!parsed.committed);
         assert!(parsed.error.is_some());
         assert_eq!(parsed.error.unwrap(), "Authentication failed");
     }
@@ -364,7 +369,7 @@ mod tests {
         let json = serde_json::to_string(&detail).unwrap();
         let parsed: RepoDetail = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.committed, true);
+        assert!(parsed.committed);
         assert_eq!(parsed.files_changed, Some(3));
         assert!(parsed.error.is_none());
     }
@@ -381,7 +386,7 @@ mod tests {
         let json = serde_json::to_string(&detail).unwrap();
         let parsed: RepoDetail = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed.committed, false);
+        assert!(!parsed.committed);
         assert!(parsed.files_changed.is_none());
         assert!(parsed.error.is_none());
     }
@@ -456,11 +461,7 @@ mod tests {
 
     #[test]
     fn test_command_all_variants() {
-        let commands = vec![
-            Command::Trigger,
-            Command::Status,
-            Command::Ping,
-        ];
+        let commands = vec![Command::Trigger, Command::Status, Command::Ping];
 
         for cmd in commands {
             let json = cmd.to_json().unwrap();

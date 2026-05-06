@@ -1,9 +1,9 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
 
 /// Main configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -71,21 +71,21 @@ impl Config {
         let content = std::fs::read_to_string(path.as_ref())
             .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
 
-        let config: Config = toml::from_str(&content)
-            .with_context(|| "Failed to parse config file")?;
+        let config: Config =
+            toml::from_str(&content).with_context(|| "Failed to parse config file")?;
 
         Ok(config)
     }
 
     /// Save configuration to a TOML file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .with_context(|| "Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
 
         // Ensure parent directory exists
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
 
         std::fs::write(path.as_ref(), content)
@@ -96,8 +96,7 @@ impl Config {
 
     /// Get the default config file path (~/.config/autogit/config.toml)
     pub fn default_config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
-            .context("Could not determine config directory")?;
+        let config_dir = dirs::config_dir().context("Could not determine config directory")?;
 
         Ok(config_dir.join("autogit").join("config.toml"))
     }
@@ -116,15 +115,6 @@ impl Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            repositories: Vec::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,13 +126,11 @@ mod tests {
                 check_interval_seconds: 60,
                 enable_tray: true,
             },
-            repositories: vec![
-                Repository {
-                    path: PathBuf::from("/home/user/notes"),
-                    auto_commit: true,
-                    commit_message_template: "Auto-commit: {timestamp}".to_owned(),
-                },
-            ],
+            repositories: vec![Repository {
+                path: PathBuf::from("/home/user/notes"),
+                auto_commit: true,
+                commit_message_template: "Auto-commit: {timestamp}".to_owned(),
+            }],
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -179,7 +167,7 @@ mod tests {
         let repo: Repository = toml::from_str(toml_str).unwrap();
 
         assert_eq!(repo.path, PathBuf::from("/home/user/repo"));
-        assert_eq!(repo.auto_commit, true); // default_true
+        assert!(repo.auto_commit); // default_true
         assert_eq!(repo.commit_message_template, "Auto-commit: {timestamp}"); // default_commit_message
     }
 
@@ -227,9 +215,12 @@ mod tests {
         let deserialized: Config = toml::from_str(&toml_str).unwrap();
 
         assert_eq!(deserialized.repositories.len(), 3);
-        assert_eq!(deserialized.repositories[0].auto_commit, true);
-        assert_eq!(deserialized.repositories[1].auto_commit, false);
-        assert_eq!(deserialized.repositories[2].commit_message_template, "Code changes");
+        assert!(deserialized.repositories[0].auto_commit);
+        assert!(!deserialized.repositories[1].auto_commit);
+        assert_eq!(
+            deserialized.repositories[2].commit_message_template,
+            "Code changes"
+        );
     }
 
     #[test]
@@ -258,7 +249,7 @@ mod tests {
 
         let repo: Repository = toml::from_str(toml_str).unwrap();
 
-        assert_eq!(repo.auto_commit, false);
+        assert!(!repo.auto_commit);
         assert_eq!(repo.commit_message_template, "Custom message");
     }
 

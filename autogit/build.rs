@@ -1,9 +1,12 @@
 use clap::CommandFactory;
-use clap_complete::{generate_to, shells::{Bash, Zsh, Fish}};
+use clap_complete::{
+    generate_to,
+    shells::{Bash, Fish, Zsh},
+};
 use std::env;
+use std::fs;
 use std::io::Error;
 use std::path::PathBuf;
-use std::fs;
 
 include!("src/cli.rs");
 
@@ -29,7 +32,10 @@ fn main() -> Result<(), Error> {
     fs::copy(&zsh_path, completions_dir.join("_autogit"))?;
     fs::copy(&fish_path, completions_dir.join("autogit.fish"))?;
 
-    println!("cargo:warning=Completions generated in {:?}", completions_dir);
+    println!(
+        "cargo:warning=Completions generated in {:?}",
+        completions_dir
+    );
 
     Ok(())
 }

@@ -1,5 +1,5 @@
-mod commands;
 mod cli;
+mod commands;
 
 use anyhow::Result;
 use clap::Parser;
@@ -10,7 +10,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Add { path, message, interval } => {
+        Commands::Add {
+            path,
+            message,
+            interval,
+        } => {
             commands::add_repository(&path, message, interval)?;
         }
         Commands::Remove { path } => {
@@ -51,16 +55,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autogit_shared::test_support::set_env_var;
     use clap::Parser;
-    use std::env;
-    use tempfile::TempDir;
     use serial_test::serial;
+    use tempfile::TempDir;
 
     #[test]
     fn test_cli_parse_add_basic() {
         let cli = Cli::parse_from(["autogit", "add", "/tmp/repo"]);
         match cli.command {
-            Commands::Add { path, message, interval } => {
+            Commands::Add {
+                path,
+                message,
+                interval,
+            } => {
                 assert_eq!(path, "/tmp/repo");
                 assert_eq!(message, None);
                 assert_eq!(interval, None);
@@ -79,7 +87,11 @@ mod tests {
             "Custom commit: {timestamp}",
         ]);
         match cli.command {
-            Commands::Add { path, message, interval } => {
+            Commands::Add {
+                path,
+                message,
+                interval,
+            } => {
                 assert_eq!(path, "/tmp/repo");
                 assert_eq!(message, Some("Custom commit: {timestamp}".to_owned()));
                 assert_eq!(interval, None);
@@ -92,7 +104,11 @@ mod tests {
     fn test_cli_parse_add_with_interval() {
         let cli = Cli::parse_from(["autogit", "add", "/tmp/repo", "--interval", "600"]);
         match cli.command {
-            Commands::Add { path, message, interval } => {
+            Commands::Add {
+                path,
+                message,
+                interval,
+            } => {
                 assert_eq!(path, "/tmp/repo");
                 assert_eq!(message, None);
                 assert_eq!(interval, Some(600));
@@ -113,7 +129,11 @@ mod tests {
             "900",
         ]);
         match cli.command {
-            Commands::Add { path, message, interval } => {
+            Commands::Add {
+                path,
+                message,
+                interval,
+            } => {
                 assert_eq!(path, "/tmp/repo");
                 assert_eq!(message, Some("Test message".to_owned()));
                 assert_eq!(interval, Some(900));
@@ -218,7 +238,7 @@ mod tests {
     #[serial]
     fn test_main_add_command() {
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create a temp git repo
         let repo_dir = temp_dir.path().join("test_repo");
@@ -238,7 +258,7 @@ mod tests {
     #[serial]
     fn test_main_list_command() {
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Should work even with no config
         let result = commands::list_repositories();
@@ -249,7 +269,7 @@ mod tests {
     #[serial]
     fn test_main_interval_command() {
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Test showing interval
         let result = commands::set_interval(None);
@@ -264,7 +284,7 @@ mod tests {
     #[serial]
     fn test_main_enable_disable_commands() {
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create a test repo
         let repo_dir = temp_dir.path().join("test_repo");
@@ -291,7 +311,7 @@ mod tests {
     #[serial]
     fn test_main_remove_command() {
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create a test repo
         let repo_dir = temp_dir.path().join("test_repo");
