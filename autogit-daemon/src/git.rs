@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use autogit_shared::Repository;
-use git2::{Repository as GitRepository, Signature, IndexAddOption, Status, StatusOptions};
 use chrono::Local;
+use git2::{IndexAddOption, Repository as GitRepository, Signature, Status, StatusOptions};
 use notify_rust::Notification;
 use std::path::Path;
 use std::process::Command;
@@ -33,7 +33,10 @@ fn push_changes(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
     let has_remote = match repo.find_remote("origin") {
         Ok(_) => true,
         Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            debug!("No remote 'origin' configured for {}, skipping push", repo_path.display());
+            debug!(
+                "No remote 'origin' configured for {}, skipping push",
+                repo_path.display()
+            );
             return Ok(false);
         }
         Err(e) => return Err(e.into()),
@@ -101,7 +104,11 @@ fn push_changes(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
         // Send desktop notification
         let _ = Notification::new()
             .summary("Git Push Failed")
-            .body(&format!("Repository: {}\n\nError:\n{}", repo_path.display(), stderr.trim()))
+            .body(&format!(
+                "Repository: {}\n\nError:\n{}",
+                repo_path.display(),
+                stderr.trim()
+            ))
             .appname(env!("CARGO_PKG_NAME"))
             .show();
 
@@ -116,7 +123,10 @@ fn pull_rebase(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
     let has_remote = match repo.find_remote("origin") {
         Ok(_) => true,
         Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            warn!("No remote 'origin' configured for {}, skipping pull", repo_path.display());
+            warn!(
+                "No remote 'origin' configured for {}, skipping pull",
+                repo_path.display()
+            );
             return Ok(false);
         }
         Err(e) => return Err(e.into()),
@@ -153,12 +163,20 @@ fn pull_rebase(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
     } else {
         // Pull failed - try to abort rebase to clean up
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("Pull --rebase failed for {}: {}", repo_path.display(), stderr.trim());
+        warn!(
+            "Pull --rebase failed for {}: {}",
+            repo_path.display(),
+            stderr.trim()
+        );
 
         // Send desktop notification
         let _ = Notification::new()
             .summary("Git Pull Failed")
-            .body(&format!("Repository: {}\n\nError:\n{}", repo_path.display(), stderr.trim()))
+            .body(&format!(
+                "Repository: {}\n\nError:\n{}",
+                repo_path.display(),
+                stderr.trim()
+            ))
             .appname(env!("CARGO_PKG_NAME"))
             .show();
 
@@ -175,8 +193,11 @@ fn pull_rebase(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
             }
             Ok(abort_output) => {
                 let abort_stderr = String::from_utf8_lossy(&abort_output.stderr);
-                debug!("Rebase abort produced output for {}: {}",
-                       repo_path.display(), abort_stderr.trim());
+                debug!(
+                    "Rebase abort produced output for {}: {}",
+                    repo_path.display(),
+                    abort_stderr.trim()
+                );
             }
             Err(e) => {
                 warn!("Failed to abort rebase for {}: {}", repo_path.display(), e);
@@ -208,7 +229,10 @@ fn initialize_repository_sync(repo_config: &Repository) -> Result<()> {
 
     // Check if there are uncommitted changes
     if has_changes(&repo)? {
-        info!("Found uncommitted changes in {}, committing before pull", repo_config.path.display());
+        info!(
+            "Found uncommitted changes in {}, committing before pull",
+            repo_config.path.display()
+        );
 
         // Stage all changes
         stage_all_changes(&repo)?;
@@ -218,7 +242,10 @@ fn initialize_repository_sync(repo_config: &Repository) -> Result<()> {
             // Create a startup commit
             let commit_message = "Auto-commit on daemon startup";
             create_commit(&repo, commit_message)?;
-            info!("Committed pending changes in {}", repo_config.path.display());
+            info!(
+                "Committed pending changes in {}",
+                repo_config.path.display()
+            );
 
             // Push the commit
             push_changes(&repo, &repo_config.path)?;
@@ -263,7 +290,11 @@ fn check_and_commit_sync(repo_config: &Repository) -> Result<bool> {
             // Create commit
             let commit_message = format_commit_message(&repo_config.commit_message_template);
             create_commit(&repo, &commit_message)?;
-            info!("Committed changes in {}: {}", repo_config.path.display(), commit_message);
+            info!(
+                "Committed changes in {}: {}",
+                repo_config.path.display(),
+                commit_message
+            );
             committed = true;
 
             // Push the commit
@@ -283,7 +314,8 @@ fn has_changes(repo: &GitRepository) -> Result<bool> {
     opts.include_untracked(true);
     opts.include_ignored(false);
 
-    let statuses = repo.statuses(Some(&mut opts))
+    let statuses = repo
+        .statuses(Some(&mut opts))
         .context("Failed to get repository status")?;
 
     Ok(!statuses.is_empty())
@@ -293,7 +325,8 @@ fn has_changes(repo: &GitRepository) -> Result<bool> {
 fn has_staged_changes(repo: &GitRepository) -> Result<bool> {
     let mut opts = StatusOptions::new();
 
-    let statuses = repo.statuses(Some(&mut opts))
+    let statuses = repo
+        .statuses(Some(&mut opts))
         .context("Failed to get repository status")?;
 
     for entry in statuses.iter() {
@@ -303,7 +336,7 @@ fn has_staged_changes(repo: &GitRepository) -> Result<bool> {
                 | Status::INDEX_MODIFIED
                 | Status::INDEX_DELETED
                 | Status::INDEX_RENAMED
-                | Status::INDEX_TYPECHANGE
+                | Status::INDEX_TYPECHANGE,
         ) {
             return Ok(true);
         }
@@ -314,19 +347,19 @@ fn has_staged_changes(repo: &GitRepository) -> Result<bool> {
 
 /// Stage all changes in the repository
 fn stage_all_changes(repo: &GitRepository) -> Result<()> {
-    let mut index = repo.index()
-        .context("Failed to get repository index")?;
+    let mut index = repo.index().context("Failed to get repository index")?;
 
     // Add all files (respects .gitignore)
-    index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
         .context("Failed to add files to index")?;
 
     // Also update tracked files that were deleted
-    index.update_all(["*"].iter(), None)
+    index
+        .update_all(["*"].iter(), None)
         .context("Failed to update index")?;
 
-    index.write()
-        .context("Failed to write index")?;
+    index.write().context("Failed to write index")?;
 
     Ok(())
 }
@@ -371,17 +404,17 @@ fn create_commit(repo: &GitRepository, message: &str) -> Result<()> {
 
 /// Get git signature from repository config (respects .gitconfig)
 fn get_signature(repo: &GitRepository) -> Result<Signature<'static>> {
-    let config = repo.config()
-        .context("Failed to get repository config")?;
+    let config = repo.config().context("Failed to get repository config")?;
 
-    let name = config.get_string("user.name")
+    let name = config
+        .get_string("user.name")
         .context("user.name not set in git config")?;
 
-    let email = config.get_string("user.email")
+    let email = config
+        .get_string("user.email")
         .context("user.email not set in git config")?;
 
-    Signature::now(&name, &email)
-        .context("Failed to create signature")
+    Signature::now(&name, &email).context("Failed to create signature")
 }
 
 /// Format commit message with placeholders replaced
@@ -651,7 +684,8 @@ mod tests {
             message,
             &tree,
             &parents,
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     // Helper to write a file to a repo
@@ -763,7 +797,8 @@ mod tests {
         stage_all_changes(&repo).unwrap();
 
         let statuses = repo.statuses(None).unwrap();
-        let staged_count = statuses.iter()
+        let staged_count = statuses
+            .iter()
             .filter(|e| e.status().intersects(Status::INDEX_NEW))
             .count();
 

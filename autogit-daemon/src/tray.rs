@@ -1,12 +1,12 @@
 use anyhow::Result;
 use autogit_shared::protocol::RepoDetail;
-use ksni::{Icon, MenuItem, Tray};
 use ksni::menu::*;
-use std::path::PathBuf;
+use ksni::{Icon, MenuItem, Tray};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 /// Tray icon state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,117 +213,141 @@ impl Tray for AutogitTray {
 
         // Daemon status
         let status_text = if suspended { "Suspended" } else { "Active" };
-        menu.push(StandardItem {
-            label: format!("Daemon status: {}", status_text),
-            enabled: false,
-            ..Default::default()
-        }.into());
+        menu.push(
+            StandardItem {
+                label: format!("Daemon status: {}", status_text),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+        );
 
         // Check interval
         if state.check_interval > 0 {
-            menu.push(StandardItem {
-                label: format!("Check interval: {} seconds", state.check_interval),
-                enabled: false,
-                ..Default::default()
-            }.into());
+            menu.push(
+                StandardItem {
+                    label: format!("Check interval: {} seconds", state.check_interval),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
         }
 
         // Last sync time
         if let Some(last_sync) = state.last_sync {
-            menu.push(StandardItem {
-                label: format!("Last sync: {}", format_time_ago(last_sync)),
-                enabled: false,
-                ..Default::default()
-            }.into());
+            menu.push(
+                StandardItem {
+                    label: format!("Last sync: {}", format_time_ago(last_sync)),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
         } else {
-            menu.push(StandardItem {
-                label: "Last sync: never".to_owned(),
-                enabled: false,
-                ..Default::default()
-            }.into());
+            menu.push(
+                StandardItem {
+                    label: "Last sync: never".to_owned(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
         }
 
         menu.push(MenuItem::Separator);
 
         // Repository list header
-        menu.push(StandardItem {
-            label: format!("Repositories ({})", state.repo_count),
-            enabled: false,
-            ..Default::default()
-        }.into());
+        menu.push(
+            StandardItem {
+                label: format!("Repositories ({})", state.repo_count),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+        );
 
         // Individual repositories with status indicators
         if state.repo_details.is_empty() {
             // No details yet, just show count
-            menu.push(StandardItem {
-                label: "  (no sync data yet)".to_owned(),
-                enabled: false,
-                ..Default::default()
-            }.into());
-        } else {
-            for repo in &state.repo_details {
-                let icon = if repo.error.is_some() {
-                    "✗"  // Error
-                } else if repo.committed {
-                    "✓"  // Success with commit
-                } else {
-                    "✓"  // Success without commit
-                };
-
-                let path = abbreviate_path(&repo.path);
-                menu.push(StandardItem {
-                    label: format!("  {} {}", icon, path),
+            menu.push(
+                StandardItem {
+                    label: "  (no sync data yet)".to_owned(),
                     enabled: false,
                     ..Default::default()
-                }.into());
+                }
+                .into(),
+            );
+        } else {
+            for repo in &state.repo_details {
+                let icon = if repo.error.is_some() { "✗" } else { "✓" };
+
+                let path = abbreviate_path(&repo.path);
+                menu.push(
+                    StandardItem {
+                        label: format!("  {} {}", icon, path),
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
         }
 
         menu.push(MenuItem::Separator);
 
         // Actions
-        menu.push(StandardItem {
-            label: "Sync Now".into(),
-            enabled: !suspended,
-            activate: Box::new(|this: &mut Self| {
-                let tx = this.trigger_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(TrayAction::TriggerSync).await {
-                        error!("Failed to send trigger sync action: {}", e);
-                    }
-                });
-            }),
-            ..Default::default()
-        }.into());
+        menu.push(
+            StandardItem {
+                label: "Sync Now".into(),
+                enabled: !suspended,
+                activate: Box::new(|this: &mut Self| {
+                    let tx = this.trigger_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tx.send(TrayAction::TriggerSync).await {
+                            error!("Failed to send trigger sync action: {}", e);
+                        }
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
 
-        menu.push(StandardItem {
-            label: if suspended { "Resume" } else { "Suspend" }.into(),
-            activate: Box::new(|this: &mut Self| {
-                let tx = this.trigger_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(TrayAction::ToggleSuspend).await {
-                        error!("Failed to send toggle suspend action: {}", e);
-                    }
-                });
-            }),
-            ..Default::default()
-        }.into());
+        menu.push(
+            StandardItem {
+                label: if suspended { "Resume" } else { "Suspend" }.into(),
+                activate: Box::new(|this: &mut Self| {
+                    let tx = this.trigger_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tx.send(TrayAction::ToggleSuspend).await {
+                            error!("Failed to send toggle suspend action: {}", e);
+                        }
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
 
         menu.push(MenuItem::Separator);
 
         // Quit
-        menu.push(StandardItem {
-            label: "Quit Autogit".into(),
-            activate: Box::new(|this: &mut Self| {
-                let tx = this.trigger_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(TrayAction::Quit).await {
-                        error!("Failed to send quit action: {}", e);
-                    }
-                });
-            }),
-            ..Default::default()
-        }.into());
+        menu.push(
+            StandardItem {
+                label: "Quit Autogit".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let tx = this.trigger_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tx.send(TrayAction::Quit).await {
+                            error!("Failed to send quit action: {}", e);
+                        }
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
 
         menu
     }
@@ -332,11 +356,11 @@ impl Tray for AutogitTray {
 // Helper functions for formatting display text
 
 /// Abbreviate a path by replacing home directory with ~
-fn abbreviate_path(path: &PathBuf) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(stripped) = path.strip_prefix(&home) {
-            return format!("~/{}", stripped.display());
-        }
+fn abbreviate_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(stripped) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", stripped.display());
     }
     path.display().to_string()
 }
@@ -378,8 +402,7 @@ fn format_time_ago(instant: Instant) -> String {
 
 fn load_png_icon(png_bytes: &[u8]) -> (i32, i32, Vec<u8>) {
     // Decode PNG image
-    let img = image::load_from_memory(png_bytes)
-        .expect("Failed to decode icon PNG");
+    let img = image::load_from_memory(png_bytes).expect("Failed to decode icon PNG");
 
     // Get dimensions
     let width = img.width() as i32;
@@ -666,7 +689,7 @@ mod tests {
 
         // Find the suspend/resume item in menu (not at fixed index anymore)
         let suspend_item = menu.iter().find(|item| {
-            if let MenuItem::Standard(ref std_item) = item {
+            if let MenuItem::Standard(std_item) = item {
                 std_item.label == "Suspend" || std_item.label == "Resume"
             } else {
                 false
@@ -674,7 +697,7 @@ mod tests {
         });
 
         assert!(suspend_item.is_some());
-        if let Some(MenuItem::Standard(ref item)) = suspend_item {
+        if let Some(MenuItem::Standard(item)) = suspend_item {
             assert_eq!(item.label, "Suspend");
         }
 
@@ -682,14 +705,14 @@ mod tests {
         suspended.store(true, std::sync::atomic::Ordering::Relaxed);
         let menu = tray.menu();
         let suspend_item = menu.iter().find(|item| {
-            if let MenuItem::Standard(ref std_item) = item {
+            if let MenuItem::Standard(std_item) = item {
                 std_item.label == "Suspend" || std_item.label == "Resume"
             } else {
                 false
             }
         });
 
-        if let Some(MenuItem::Standard(ref item)) = suspend_item {
+        if let Some(MenuItem::Standard(item)) = suspend_item {
             assert_eq!(item.label, "Resume");
         }
     }
@@ -704,14 +727,14 @@ mod tests {
 
         // Find "Sync Now" item in menu (not at fixed index anymore)
         let sync_now_item = menu.iter().find(|item| {
-            if let MenuItem::Standard(ref std_item) = item {
+            if let MenuItem::Standard(std_item) = item {
                 std_item.label == "Sync Now"
             } else {
                 false
             }
         });
         assert!(sync_now_item.is_some());
-        if let Some(MenuItem::Standard(ref item)) = sync_now_item {
+        if let Some(MenuItem::Standard(item)) = sync_now_item {
             assert!(item.enabled);
         }
 
@@ -719,13 +742,13 @@ mod tests {
         suspended.store(true, std::sync::atomic::Ordering::Relaxed);
         let menu = tray.menu();
         let sync_now_item = menu.iter().find(|item| {
-            if let MenuItem::Standard(ref std_item) = item {
+            if let MenuItem::Standard(std_item) = item {
                 std_item.label == "Sync Now"
             } else {
                 false
             }
         });
-        if let Some(MenuItem::Standard(ref item)) = sync_now_item {
+        if let Some(MenuItem::Standard(item)) = sync_now_item {
             assert!(!item.enabled);
         }
     }
@@ -755,10 +778,16 @@ mod tests {
         let state = tray.get_state();
         assert_eq!(state.repo_details.len(), 2);
         assert_eq!(state.repo_count, 2);
-        assert_eq!(state.repo_details[0].path, PathBuf::from("/home/user/repo1"));
+        assert_eq!(
+            state.repo_details[0].path,
+            PathBuf::from("/home/user/repo1")
+        );
         assert!(state.repo_details[0].committed);
         assert!(state.repo_details[0].error.is_none());
-        assert_eq!(state.repo_details[1].path, PathBuf::from("/home/user/repo2"));
+        assert_eq!(
+            state.repo_details[1].path,
+            PathBuf::from("/home/user/repo2")
+        );
         assert!(!state.repo_details[1].committed);
         assert!(state.repo_details[1].error.is_some());
     }
@@ -785,7 +814,7 @@ mod tests {
 
         // Find the check interval item
         let interval_item = menu.iter().find(|item| {
-            if let MenuItem::Standard(ref std_item) = item {
+            if let MenuItem::Standard(std_item) = item {
                 std_item.label.contains("Check interval")
             } else {
                 false
@@ -793,7 +822,7 @@ mod tests {
         });
 
         assert!(interval_item.is_some());
-        if let Some(MenuItem::Standard(ref item)) = interval_item {
+        if let Some(MenuItem::Standard(item)) = interval_item {
             assert_eq!(item.label, "Check interval: 120 seconds");
             assert!(!item.enabled);
         }
@@ -824,21 +853,24 @@ mod tests {
         let menu = tray.menu();
 
         // Should contain repository paths with status indicators
-        let repo_items: Vec<_> = menu.iter().filter(|item| {
-            if let MenuItem::Standard(ref std_item) = item {
-                std_item.label.contains("/home/user/repo")
-            } else {
-                false
-            }
-        }).collect();
+        let repo_items: Vec<_> = menu
+            .iter()
+            .filter(|item| {
+                if let MenuItem::Standard(std_item) = item {
+                    std_item.label.contains("/home/user/repo")
+                } else {
+                    false
+                }
+            })
+            .collect();
 
         assert_eq!(repo_items.len(), 2);
 
         // Check for success/error indicators
-        if let Some(MenuItem::Standard(ref item)) = repo_items.get(0) {
+        if let Some(MenuItem::Standard(item)) = repo_items.first() {
             assert!(item.label.contains("✓"));
         }
-        if let Some(MenuItem::Standard(ref item)) = repo_items.get(1) {
+        if let Some(MenuItem::Standard(item)) = repo_items.get(1) {
             assert!(item.label.contains("✗"));
         }
     }

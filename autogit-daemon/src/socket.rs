@@ -1,18 +1,17 @@
 use anyhow::{Context, Result};
-use autogit_shared::{Command, Response, ResponseData, RepoDetail, socket_path};
+use autogit_shared::{Command, RepoDetail, Response, ResponseData, socket_path};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 use crate::Config;
 
 /// Start the Unix socket listener
 pub fn create_listener() -> Result<UnixListener> {
-    let socket_path = socket_path()
-        .context("Failed to get socket path")?;
+    let socket_path = socket_path().context("Failed to get socket path")?;
 
     // Remove old socket file if it exists (from previous unclean shutdown)
     if socket_path.exists() {
@@ -37,13 +36,13 @@ pub fn create_listener() -> Result<UnixListener> {
 
 /// Clean up the socket file on shutdown
 pub fn cleanup_socket() {
-    if let Ok(path) = socket_path() {
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                error!("Failed to remove socket file: {:#}", e);
-            } else {
-                info!("Removed socket file: {}", path.display());
-            }
+    if let Ok(path) = socket_path()
+        && path.exists()
+    {
+        if let Err(e) = std::fs::remove_file(&path) {
+            error!("Failed to remove socket file: {:#}", e);
+        } else {
+            info!("Removed socket file: {}", path.display());
         }
     }
 }
@@ -70,7 +69,9 @@ async fn handle_connection_impl(
     let mut line = String::new();
 
     // Read one line (JSON command)
-    reader.read_line(&mut line).await
+    reader
+        .read_line(&mut line)
+        .await
         .context("Failed to read command from socket")?;
 
     if line.is_empty() {
@@ -79,41 +80,30 @@ async fn handle_connection_impl(
     }
 
     // Parse command
-    let command = Command::from_json(&line)
-        .context("Failed to parse command")?;
+    let command = Command::from_json(&line).context("Failed to parse command")?;
 
     info!("Received socket command: {:?}", command);
 
     // Execute command and get response
     let response = match command {
-        Command::Ping => {
-            Response::ok("pong")
-        }
-        Command::Status => {
-            handle_status_command(config, start_time, suspended.clone()).await
-        }
-        Command::Trigger => {
-            handle_trigger_command(config).await
-        }
-        Command::Suspend => {
-            handle_suspend_command(suspended.clone()).await
-        }
-        Command::Resume => {
-            handle_resume_command(suspended.clone()).await
-        }
+        Command::Ping => Response::ok("pong"),
+        Command::Status => handle_status_command(config, start_time, suspended.clone()).await,
+        Command::Trigger => handle_trigger_command(config).await,
+        Command::Suspend => handle_suspend_command(suspended.clone()).await,
+        Command::Resume => handle_resume_command(suspended.clone()).await,
     };
 
     // Send response
-    let response_json = response.to_json()
-        .context("Failed to serialize response")?;
+    let response_json = response.to_json().context("Failed to serialize response")?;
 
     let stream = reader.into_inner();
     let mut stream = stream;
-    stream.write_all(response_json.as_bytes()).await
+    stream
+        .write_all(response_json.as_bytes())
+        .await
         .context("Failed to write response to socket")?;
 
-    stream.flush().await
-        .context("Failed to flush socket")?;
+    stream.flush().await.context("Failed to flush socket")?;
 
     Ok(())
 }
@@ -176,7 +166,11 @@ async fn handle_trigger_command(config: Arc<RwLock<Config>>) -> Response {
                 }
             }
             Err(e) => {
-                error!("Error processing repository {}: {:#}", repo.path.display(), e);
+                error!(
+                    "Error processing repository {}: {:#}",
+                    repo.path.display(),
+                    e
+                );
                 details.push(RepoDetail {
                     path: repo.path.clone(),
                     committed: false,
@@ -187,10 +181,16 @@ async fn handle_trigger_command(config: Arc<RwLock<Config>>) -> Response {
         }
     }
 
-    info!("Manual trigger complete: checked {}, committed {}", repos_checked, repos_committed);
+    info!(
+        "Manual trigger complete: checked {}, committed {}",
+        repos_checked, repos_committed
+    );
 
     Response::ok_with_data(
-        format!("Checked {} repositories, committed changes in {}", repos_checked, repos_committed),
+        format!(
+            "Checked {} repositories, committed changes in {}",
+            repos_checked, repos_committed
+        ),
         ResponseData::Trigger {
             repos_checked,
             repos_committed,
@@ -224,12 +224,12 @@ async fn handle_resume_command(suspended: Arc<std::sync::atomic::AtomicBool>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autogit_shared::test_support::set_env_var;
     use autogit_shared::{Config, DaemonConfig, Repository, ResponseStatus};
+    use serial_test::serial;
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
-    use std::env;
-    use serial_test::serial;
 
     fn create_test_config() -> Config {
         Config {
@@ -278,7 +278,12 @@ mod tests {
         assert_eq!(response.status, ResponseStatus::Ok);
         assert_eq!(response.message, "Daemon status");
 
-        if let Some(ResponseData::Status { uptime_seconds, check_interval_seconds, repositories_count }) = response.data {
+        if let Some(ResponseData::Status {
+            uptime_seconds,
+            check_interval_seconds,
+            repositories_count,
+        }) = response.data
+        {
             assert_eq!(uptime_seconds, 0); // Just started
             assert_eq!(check_interval_seconds, 300);
             assert_eq!(repositories_count, 0);
@@ -299,7 +304,12 @@ mod tests {
 
         assert_eq!(response.status, ResponseStatus::Ok);
 
-        if let Some(ResponseData::Status { uptime_seconds, check_interval_seconds, repositories_count }) = response.data {
+        if let Some(ResponseData::Status {
+            uptime_seconds,
+            check_interval_seconds,
+            repositories_count,
+        }) = response.data
+        {
             // uptime_seconds is u64, so it's always >= 0, just verify it exists
             let _ = uptime_seconds;
             assert_eq!(check_interval_seconds, 120);
@@ -334,7 +344,12 @@ mod tests {
         assert_eq!(response.status, ResponseStatus::Ok);
         assert!(response.message.contains("0 repositories"));
 
-        if let Some(ResponseData::Trigger { repos_checked, repos_committed, details }) = response.data {
+        if let Some(ResponseData::Trigger {
+            repos_checked,
+            repos_committed,
+            details,
+        }) = response.data
+        {
             assert_eq!(repos_checked, 0);
             assert_eq!(repos_committed, 0);
             assert_eq!(details.len(), 0);
@@ -353,7 +368,12 @@ mod tests {
 
         assert_eq!(response.status, ResponseStatus::Ok);
 
-        if let Some(ResponseData::Trigger { repos_checked, details, .. }) = response.data {
+        if let Some(ResponseData::Trigger {
+            repos_checked,
+            details,
+            ..
+        }) = response.data
+        {
             // Should only check repo1 and repo3 (auto_commit=true)
             // repo2 is disabled (auto_commit=false)
             assert_eq!(repos_checked, 2);
@@ -384,7 +404,7 @@ mod tests {
     fn test_cleanup_socket_no_socket() {
         // Setup temp config dir
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Socket doesn't exist, should not error
         cleanup_socket();
@@ -399,7 +419,7 @@ mod tests {
     fn test_cleanup_socket_removes_existing() {
         // Setup temp config dir
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         // Create the socket directory and a fake socket file
         let socket_path = socket_path().unwrap();
@@ -420,7 +440,7 @@ mod tests {
     async fn test_create_listener_creates_parent_dir() {
         // Setup temp config dir
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let socket_path = socket_path().unwrap();
         assert!(!socket_path.exists());
@@ -443,7 +463,7 @@ mod tests {
     async fn test_create_listener_removes_stale_socket() {
         // Setup temp config dir
         let temp_dir = TempDir::new().unwrap();
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
 
         let socket_path = socket_path().unwrap();
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
@@ -503,7 +523,11 @@ mod tests {
 
             let response = handle_status_command(config, start_time, suspended).await;
 
-            if let Some(ResponseData::Status { check_interval_seconds, .. }) = response.data {
+            if let Some(ResponseData::Status {
+                check_interval_seconds,
+                ..
+            }) = response.data
+            {
                 assert_eq!(check_interval_seconds, interval);
             } else {
                 panic!("Expected Status response data");
@@ -598,7 +622,12 @@ mod tests {
         assert_eq!(response.message, "Daemon status (suspended)");
 
         // Check that response includes status data
-        if let Some(ResponseData::Status { uptime_seconds: _, check_interval_seconds, repositories_count }) = response.data {
+        if let Some(ResponseData::Status {
+            uptime_seconds: _,
+            check_interval_seconds,
+            repositories_count,
+        }) = response.data
+        {
             assert_eq!(check_interval_seconds, 300); // From create_test_config()
             assert_eq!(repositories_count, 0); // No repos in test config
         } else {
