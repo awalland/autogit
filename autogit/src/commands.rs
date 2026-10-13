@@ -9,8 +9,9 @@ use tabled::{
     Table, Tabled,
     settings::{Modify, Style, Width, object::Columns},
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::time::{Duration, Instant, timeout_at};
 
 /// Add a repository to the configuration
 pub fn add_repository(path: &str, message: Option<String>, interval: Option<u64>) -> Result<()> {
@@ -355,9 +356,12 @@ pub fn edit_config() -> Result<()> {
 }
 
 fn edit_config_at(config_path: &Path, editor: &str) -> Result<()> {
+    let arguments = shell_words::split(editor).context("Failed to parse EDITOR command")?;
+    let (program, arguments) = arguments.split_first().context("EDITOR command is empty")?;
     println!("Opening {} in {}...", config_path.display(), editor);
     Config::edit_file(config_path, |temporary_path| {
-        let status = std::process::Command::new(editor)
+        let status = std::process::Command::new(program)
+            .args(arguments)
             .arg(temporary_path)
             .status()
             .context("Failed to open editor")?;
@@ -516,45 +520,75 @@ async fn send_daemon_command(command: DaemonCommand) -> Result<Response> {
     send_daemon_command_at(&socket_path()?, command).await
 }
 
+const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const TRIGGER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_DAEMON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+struct DaemonExchangeLimits {
+    request_timeout: Duration,
+    trigger_response_timeout: Duration,
+    max_response_bytes: usize,
+}
+
 async fn send_daemon_command_at(socket_path: &Path, command: DaemonCommand) -> Result<Response> {
-    // Try to connect to the socket
-    let stream = UnixStream::connect(socket_path).await
-        .with_context(|| format!(
+    exchange_daemon_command(
+        socket_path,
+        command,
+        DaemonExchangeLimits {
+            request_timeout: CONTROL_COMMAND_TIMEOUT,
+            trigger_response_timeout: TRIGGER_RESPONSE_TIMEOUT,
+            max_response_bytes: MAX_DAEMON_RESPONSE_BYTES,
+        },
+    )
+    .await
+}
+
+async fn exchange_daemon_command(
+    socket_path: &Path,
+    command: DaemonCommand,
+    limits: DaemonExchangeLimits,
+) -> Result<Response> {
+    let triggered = matches!(command, DaemonCommand::Trigger);
+    let request_deadline = Instant::now() + limits.request_timeout;
+    let mut stream = timeout_at(request_deadline, async {
+        let mut stream = UnixStream::connect(socket_path).await.with_context(|| format!(
             "Failed to connect to daemon socket: {}\nIs the daemon running? Start it with: systemctl --user start autogit-daemon",
             socket_path.display()
         ))?;
+        let command_json = command.to_json().context("Failed to serialize command")?;
+        stream.write_all(command_json.as_bytes()).await.context("Failed to send command to daemon")?;
+        stream.flush().await.context("Failed to flush socket")?;
+        stream.shutdown().await.context("Failed to shutdown write side of socket")?;
+        Ok::<_, anyhow::Error>(stream)
+    }).await.context("Timed out sending command to daemon; any accepted work may continue")??;
 
-    // Send command
-    let command_json = command.to_json().context("Failed to serialize command")?;
-
-    let mut stream = stream;
-    stream
-        .write_all(command_json.as_bytes())
+    let response_deadline = if triggered {
+        Instant::now() + limits.trigger_response_timeout
+    } else {
+        request_deadline
+    };
+    let timeout_message = if triggered {
+        "Timed out waiting for synchronisation results; daemon work may continue"
+    } else {
+        "Timed out waiting for daemon response"
+    };
+    let mut reader = BufReader::new(&mut stream).take((limits.max_response_bytes + 1) as u64);
+    let mut line = Vec::new();
+    timeout_at(response_deadline, reader.read_until(b'\n', &mut line))
         .await
-        .context("Failed to send command to daemon")?;
-
-    stream.flush().await.context("Failed to flush socket")?;
-
-    // Shutdown write side to signal we're done sending
-    stream
-        .shutdown()
-        .await
-        .context("Failed to shutdown write side of socket")?;
-
-    // Read response
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-
-    reader
-        .read_line(&mut line)
-        .await
+        .context(timeout_message)?
         .context("Failed to read response from daemon")?;
-
+    if line.len() > limits.max_response_bytes {
+        bail!(
+            "Daemon response exceeds {} bytes",
+            limits.max_response_bytes
+        );
+    }
     if line.is_empty() {
         bail!("Daemon closed connection without sending response");
     }
-
-    Response::from_json(&line).context("Failed to parse daemon response")
+    let line = std::str::from_utf8(&line).context("Daemon response is not valid UTF-8")?;
+    Response::from_json(line).context("Failed to parse daemon response")
 }
 
 #[cfg(test)]
@@ -1503,6 +1537,168 @@ mod tests {
                 .unwrap();
         });
         show_status_at(&config_path, &socket_path).await.unwrap();
+        server.await.unwrap();
+    }
+    #[test]
+    fn editor_command_supports_quoted_arguments_without_a_shell() {
+        let directory = TempDir::new().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let script = directory.path().join("editor with spaces.py");
+        fs::write(&script, "import sys\nfrom pathlib import Path\nassert sys.argv[1:3] == ['--label', 'argument with spaces']\nPath(sys.argv[3]).write_text('[daemon]\\ncheck_interval_seconds = 42\\n')\n").unwrap();
+        let editor = shell_words::join([
+            "python3",
+            script.to_str().unwrap(),
+            "--label",
+            "argument with spaces",
+        ]);
+        edit_config_at(&config_path, &editor).unwrap();
+        assert_eq!(
+            Config::load(&config_path)
+                .unwrap()
+                .daemon
+                .check_interval_seconds,
+            42
+        );
+    }
+
+    #[test]
+    fn failed_and_malformed_editors_leave_configuration_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let config_path = directory.path().join("config.toml");
+        Config::default().save(&config_path).unwrap();
+        let original = fs::read(&config_path).unwrap();
+        let failing_editor = shell_words::join(["python3", "-c", "import sys; sys.exit(7)"]);
+        for editor in [failing_editor.as_str(), "", "unterminated '"] {
+            assert!(edit_config_at(&config_path, editor).is_err());
+            assert_eq!(fs::read(&config_path).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_control_response_has_a_deadline() {
+        let directory = TempDir::new().unwrap();
+        let socket_path = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            wait.await.unwrap();
+        });
+        let error = exchange_daemon_command(
+            &socket_path,
+            DaemonCommand::Status,
+            DaemonExchangeLimits {
+                request_timeout: Duration::from_millis(50),
+                trigger_response_timeout: Duration::from_secs(1),
+                max_response_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Timed out waiting for daemon response")
+        );
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_timeout_explains_that_work_may_continue() {
+        let directory = TempDir::new().unwrap();
+        let socket_path = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert!(matches!(
+                DaemonCommand::from_json(&request).unwrap(),
+                DaemonCommand::Trigger
+            ));
+            wait.await.unwrap();
+        });
+        let error = exchange_daemon_command(
+            &socket_path,
+            DaemonCommand::Trigger,
+            DaemonExchangeLimits {
+                request_timeout: Duration::from_secs(1),
+                trigger_response_timeout: Duration::from_millis(20),
+                max_response_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("daemon work may continue"));
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_daemon_response_is_rejected_before_peer_closes() {
+        let directory = TempDir::new().unwrap();
+        let socket_path = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            reader.get_mut().write_all(&[b'x'; 65]).await.unwrap();
+            wait.await.unwrap();
+        });
+        let error = exchange_daemon_command(
+            &socket_path,
+            DaemonCommand::Ping,
+            DaemonExchangeLimits {
+                request_timeout: Duration::from_secs(1),
+                trigger_response_timeout: Duration::from_secs(1),
+                max_response_bytes: 64,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds 64 bytes"));
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_response_can_outlast_control_deadline() {
+        let directory = TempDir::new().unwrap();
+        let socket_path = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reader
+                .get_mut()
+                .write_all(Response::ok("Finished").to_json().unwrap().as_bytes())
+                .await
+                .unwrap();
+        });
+        let response = exchange_daemon_command(
+            &socket_path,
+            DaemonCommand::Trigger,
+            DaemonExchangeLimits {
+                request_timeout: Duration::from_millis(50),
+                trigger_response_timeout: Duration::from_secs(1),
+                max_response_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.message, "Finished");
         server.await.unwrap();
     }
 }
