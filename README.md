@@ -74,6 +74,9 @@ All sync requests run through one coordinator. Repositories with active Git
 operations or unresolved conflicts are left untouched. Remote changes are pulled
 with rebase before pushing, and subsequent cycles retry unpublished commits even
 when there are no new file changes. Git subprocesses have a 60-second deadline.
+A failed pull retains any in-progress rebase for manual resolution or abortion.
+Background requests are coalesced into one pending cycle, and each repository
+uses its current settings when that operation starts.
 
 ## Configuration
 
@@ -82,6 +85,10 @@ Configuration is stored at `~/.config/autogit/config.toml`.
 The interval must be at least 1 second and fit the platform's timer range.
 CLI updates are locked and written atomically. `autogit edit` validates an edited
 private copy before publishing it; invalid edits leave the current file intact.
+Editing leaves other configuration commands available. Concurrent changes cause
+publication to fail with the edited copy retained at the reported recovery path.
+Symlinked configuration files keep their links, and the daemon follows target
+updates and link retargeting.
 The daemon keeps its applied configuration if a direct file edit is invalid.
 
 Example configuration:

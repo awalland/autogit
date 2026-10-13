@@ -5,6 +5,7 @@ use git2::Repository as GitRepository;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -204,6 +205,38 @@ fn configuration_replacements_and_invalid_updates_preserve_live_state() {
     .unwrap();
     wait_until(|| daemon.logs().contains("Configuration reload failed"));
     assert_eq!(daemon.status().interval, 3602);
+    daemon.stop();
+}
+
+#[test]
+fn symlinked_configuration_follows_target_updates_and_retargeting() {
+    let directory = TempDir::new().unwrap();
+    let dotfiles = directory.path().join("dotfiles");
+    fs::create_dir(&dotfiles).unwrap();
+    let first = dotfiles.join("first.toml");
+    let second = dotfiles.join("second.toml");
+    let mut initial = config(vec![]);
+    initial.save(&first).unwrap();
+    initial.daemon.check_interval_seconds = 3602;
+    initial.save(&second).unwrap();
+    let config_directory = directory.path().join("autogit");
+    fs::create_dir(&config_directory).unwrap();
+    let config_path = config_directory.join("config.toml");
+    symlink("../dotfiles/first.toml", &config_path).unwrap();
+    let mut daemon = Daemon::start(directory.path(), &config(vec![]), None);
+    assert!(config_path.is_symlink());
+    let mut updated = config(vec![]);
+    updated.daemon.check_interval_seconds = 3601;
+    updated.save(&first).unwrap();
+    wait_until(|| daemon.status().interval == 3601);
+    let replacement = config_directory.join("replacement");
+    symlink("../dotfiles/second.toml", &replacement).unwrap();
+    fs::rename(replacement, &config_path).unwrap();
+    wait_until(|| daemon.status().interval == 3602);
+    updated.daemon.check_interval_seconds = 3603;
+    updated.save(&second).unwrap();
+    wait_until(|| daemon.status().interval == 3603);
+    assert!(config_path.is_symlink());
     daemon.stop();
 }
 
