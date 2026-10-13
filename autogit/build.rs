@@ -4,13 +4,12 @@ use clap_complete::{
     shells::{Bash, Fish, Zsh},
 };
 use std::env;
-use std::fs;
 use std::io::Error;
-use std::path::PathBuf;
 
 include!("src/cli.rs");
 
 fn main() -> Result<(), Error> {
+    println!("cargo:rerun-if-changed=src/cli.rs");
     let outdir = match env::var_os("OUT_DIR") {
         None => return Ok(()),
         Some(outdir) => outdir,
@@ -19,18 +18,9 @@ fn main() -> Result<(), Error> {
     let mut cmd = Cli::command();
 
     // Generate completions
-    let bash_path = generate_to(Bash, &mut cmd, "autogit", &outdir)?;
-    let zsh_path = generate_to(Zsh, &mut cmd, "autogit", &outdir)?;
-    let fish_path = generate_to(Fish, &mut cmd, "autogit", &outdir)?;
-
-    // Also copy them to a known location in the build directory
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let completions_dir = PathBuf::from(&manifest_dir).join("completions");
-    fs::create_dir_all(&completions_dir)?;
-
-    fs::copy(&bash_path, completions_dir.join("autogit.bash"))?;
-    fs::copy(&zsh_path, completions_dir.join("_autogit"))?;
-    fs::copy(&fish_path, completions_dir.join("autogit.fish"))?;
+    generate_to(Bash, &mut cmd, "autogit", &outdir)?;
+    generate_to(Zsh, &mut cmd, "autogit", &outdir)?;
+    generate_to(Fish, &mut cmd, "autogit", &outdir)?;
 
     Ok(())
 }
