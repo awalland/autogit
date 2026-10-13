@@ -20,8 +20,8 @@ pub enum Commands {
         #[arg(short, long)]
         message: Option<String>,
 
-        /// Check interval in seconds (optional, uses daemon default if not set)
-        #[arg(short, long)]
+        /// Global check interval in seconds (optional, keeps the existing interval)
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(1..))]
         interval: Option<u64>,
     },
 
@@ -49,6 +49,7 @@ pub enum Commands {
     /// Set or show the global check interval
     Interval {
         /// Interval in seconds (if not provided, shows current interval)
+        #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         seconds: Option<u64>,
     },
 
@@ -66,4 +67,16 @@ pub enum Commands {
 
     /// Resume the daemon (restart automatic syncing)
     Resume,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_intervals_are_rejected_before_command_execution() {
+        assert!(Cli::try_parse_from(["autogit", "interval", "0"]).is_err());
+        assert!(Cli::try_parse_from(["autogit", "add", "/repository", "--interval", "0"]).is_err());
+        assert!(Cli::try_parse_from(["autogit", "interval", "1"]).is_ok());
+    }
 }
