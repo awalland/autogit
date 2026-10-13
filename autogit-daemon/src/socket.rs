@@ -1,61 +1,80 @@
-use anyhow::{Context, Result};
-use autogit_shared::{Command, RepoDetail, Response, ResponseData, socket_path};
+use crate::coordinator::Coordinator;
+use anyhow::{Context, Result, bail};
+use autogit_shared::{Command, Config, Response, ResponseData};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::error;
 
-use crate::Config;
-
-/// Start the Unix socket listener
-pub fn create_listener() -> Result<UnixListener> {
-    let socket_path = socket_path().context("Failed to get socket path")?;
-
-    // Remove old socket file if it exists (from previous unclean shutdown)
-    if socket_path.exists() {
-        warn!("Removing stale socket file: {}", socket_path.display());
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("Failed to remove stale socket: {}", socket_path.display()))?;
-    }
-
-    // Ensure parent directory exists
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create socket directory: {}", parent.display()))?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("Failed to bind Unix socket: {}", socket_path.display()))?;
-
-    info!("Listening on Unix socket: {}", socket_path.display());
-
-    Ok(listener)
+/// Holds the instance lock and removes only the socket inode this instance bound.
+pub struct SocketOwner {
+    _lock: File,
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
 }
 
-/// Clean up the socket file on shutdown
-pub fn cleanup_socket() {
-    if let Ok(path) = socket_path()
-        && path.exists()
-    {
-        if let Err(e) = std::fs::remove_file(&path) {
-            error!("Failed to remove socket file: {:#}", e);
-        } else {
-            info!("Removed socket file: {}", path.display());
+impl SocketOwner {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path.parent().context("Socket path has no parent")?)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        lock.try_lock()
+            .context("Another autogit daemon owns the instance lock")?;
+        Ok(Self {
+            _lock: lock,
+            path: path.to_owned(),
+            identity: None,
+        })
+    }
+
+    pub fn bind(&mut self) -> Result<UnixListener> {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "Refusing to replace non-socket path: {}",
+                    self.path.display()
+                );
+            }
+            if std::os::unix::net::UnixStream::connect(&self.path).is_ok() {
+                bail!("Another daemon is listening on {}", self.path.display());
+            }
+            std::fs::remove_file(&self.path)?;
+        }
+        let listener = UnixListener::bind(&self.path)?;
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        self.identity = Some((metadata.dev(), metadata.ino()));
+        Ok(listener)
+    }
+}
+
+impl Drop for SocketOwner {
+    fn drop(&mut self) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && self.identity == Some((metadata.dev(), metadata.ino()))
+            && let Err(error) = std::fs::remove_file(&self.path)
+        {
+            error!(%error, "Failed to remove owned socket");
         }
     }
 }
 
-/// Handle an incoming connection
 pub async fn handle_connection(
     stream: UnixStream,
     config: Arc<RwLock<Config>>,
     start_time: Instant,
-    suspended: Arc<std::sync::atomic::AtomicBool>,
+    coordinator: Coordinator,
 ) {
-    if let Err(e) = handle_connection_impl(stream, config, start_time, suspended).await {
-        error!("Error handling socket connection: {:#}", e);
+    if let Err(error) = handle_connection_impl(stream, config, start_time, coordinator).await {
+        error!(%error, "Socket connection failed");
     }
 }
 
@@ -63,575 +82,114 @@ async fn handle_connection_impl(
     stream: UnixStream,
     config: Arc<RwLock<Config>>,
     start_time: Instant,
-    suspended: Arc<std::sync::atomic::AtomicBool>,
+    coordinator: Coordinator,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-
-    // Read one line (JSON command)
-    reader
-        .read_line(&mut line)
-        .await
-        .context("Failed to read command from socket")?;
-
-    if line.is_empty() {
-        // Connection closed
+    // Bound both idle clients and command size; a client cannot retain unlimited memory.
+    let mut line = Vec::new();
+    use tokio::io::AsyncReadExt;
+    let size = tokio::time::timeout(
+        Duration::from_secs(10),
+        (&mut reader).take(4097).read_until(b'\n', &mut line),
+    )
+    .await??;
+    if size == 0 {
         return Ok(());
     }
-
-    // Parse command
-    let command = Command::from_json(&line).context("Failed to parse command")?;
-
-    info!("Received socket command: {:?}", command);
-
-    // Execute command and get response
-    let response = match command {
-        Command::Ping => Response::ok("pong"),
-        Command::Status => handle_status_command(config, start_time, suspended.clone()).await,
-        Command::Trigger => handle_trigger_command(config).await,
-        Command::Suspend => handle_suspend_command(suspended.clone()).await,
-        Command::Resume => handle_resume_command(suspended.clone()).await,
+    let response = if size > 4096 || line.last() != Some(&b'\n') {
+        Response::error("Invalid command length")
+    } else {
+        match Command::from_json(std::str::from_utf8(&line)?) {
+            Ok(Command::Ping) => Response::ok("pong"),
+            Ok(Command::Trigger) => coordinator.trigger().await,
+            Ok(Command::Status) => {
+                let config = config.read().await.clone();
+                let state = coordinator.state.borrow().clone();
+                Response::ok_with_data(
+                    "Daemon status",
+                    ResponseData::Status {
+                        uptime_seconds: start_time.elapsed().as_secs(),
+                        check_interval_seconds: config.daemon.check_interval_seconds,
+                        repositories_count: config.repositories.len(),
+                        config: config.clone(),
+                        suspended: coordinator.suspended.load(Ordering::SeqCst),
+                        syncing: state.syncing,
+                        details: state
+                            .details
+                            .into_iter()
+                            .filter(|detail| {
+                                config
+                                    .repositories
+                                    .iter()
+                                    .any(|repo| repo.path == detail.path)
+                            })
+                            .collect(),
+                    },
+                )
+            }
+            Ok(Command::Suspend) => {
+                coordinator.set_suspended(true);
+                Response::ok("Daemon suspended")
+            }
+            Ok(Command::Resume) => {
+                coordinator.set_suspended(false);
+                coordinator.schedule(None);
+                Response::ok("Daemon resumed")
+            }
+            Err(error) => Response::error(format!("Invalid command: {error}")),
+        }
     };
-
-    // Send response
-    let response_json = response.to_json().context("Failed to serialize response")?;
-
-    let stream = reader.into_inner();
-    let mut stream = stream;
-    stream
-        .write_all(response_json.as_bytes())
-        .await
-        .context("Failed to write response to socket")?;
-
-    stream.flush().await.context("Failed to flush socket")?;
-
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        reader.get_mut().write_all(response.to_json()?.as_bytes()),
+    )
+    .await??;
     Ok(())
-}
-
-async fn handle_status_command(
-    config: Arc<RwLock<Config>>,
-    start_time: Instant,
-    suspended: Arc<std::sync::atomic::AtomicBool>,
-) -> Response {
-    let cfg = config.read().await;
-    let uptime = start_time.elapsed().as_secs();
-    let is_suspended = suspended.load(std::sync::atomic::Ordering::Relaxed);
-
-    let message = if is_suspended {
-        "Daemon status (suspended)"
-    } else {
-        "Daemon status"
-    };
-
-    Response::ok_with_data(
-        message,
-        ResponseData::Status {
-            uptime_seconds: uptime,
-            check_interval_seconds: cfg.daemon.check_interval_seconds,
-            repositories_count: cfg.repositories.len(),
-        },
-    )
-}
-
-async fn handle_trigger_command(config: Arc<RwLock<Config>>) -> Response {
-    let cfg = config.read().await;
-
-    let mut repos_checked = 0;
-    let mut repos_committed = 0;
-    let mut details = Vec::new();
-
-    // Process each repository
-    for repo in &cfg.repositories {
-        if !repo.auto_commit {
-            continue;
-        }
-
-        repos_checked += 1;
-
-        match crate::git::check_and_commit(repo).await {
-            Ok(committed) => {
-                if committed {
-                    repos_committed += 1;
-                }
-
-                details.push(RepoDetail {
-                    path: repo.path.clone(),
-                    committed,
-                    files_changed: if committed { Some(0) } else { None }, // TODO: track actual file count
-                    error: None,
-                });
-
-                if committed {
-                    info!("Committed changes in: {}", repo.path.display());
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Error processing repository {}: {:#}",
-                    repo.path.display(),
-                    e
-                );
-                details.push(RepoDetail {
-                    path: repo.path.clone(),
-                    committed: false,
-                    files_changed: None,
-                    error: Some(format!("{:#}", e)),
-                });
-            }
-        }
-    }
-
-    info!(
-        "Manual trigger complete: checked {}, committed {}",
-        repos_checked, repos_committed
-    );
-
-    Response::ok_with_data(
-        format!(
-            "Checked {} repositories, committed changes in {}",
-            repos_checked, repos_committed
-        ),
-        ResponseData::Trigger {
-            repos_checked,
-            repos_committed,
-            details,
-        },
-    )
-}
-
-async fn handle_suspend_command(suspended: Arc<std::sync::atomic::AtomicBool>) -> Response {
-    let was_suspended = suspended.swap(true, std::sync::atomic::Ordering::Relaxed);
-
-    if was_suspended {
-        Response::ok("Daemon was already suspended")
-    } else {
-        info!("Daemon suspended via socket command");
-        Response::ok("Daemon suspended")
-    }
-}
-
-async fn handle_resume_command(suspended: Arc<std::sync::atomic::AtomicBool>) -> Response {
-    let was_suspended = suspended.swap(false, std::sync::atomic::Ordering::Relaxed);
-
-    if !was_suspended {
-        Response::ok("Daemon was already running")
-    } else {
-        info!("Daemon resumed via socket command");
-        Response::ok("Daemon resumed")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autogit_shared::test_support::set_env_var;
-    use autogit_shared::{Config, DaemonConfig, Repository, ResponseStatus};
-    use serial_test::serial;
-    use std::path::PathBuf;
-    use std::time::Duration;
     use tempfile::TempDir;
 
-    fn create_test_config() -> Config {
-        Config {
-            daemon: DaemonConfig {
-                check_interval_seconds: 300,
-                enable_tray: false,
-            },
-            repositories: vec![],
-        }
-    }
-
-    fn create_test_config_with_repos() -> Config {
-        Config {
-            daemon: DaemonConfig {
-                check_interval_seconds: 120,
-                enable_tray: false,
-            },
-            repositories: vec![
-                Repository {
-                    path: PathBuf::from("/test/repo1"),
-                    auto_commit: true,
-                    commit_message_template: "Auto: {timestamp}".to_owned(),
-                },
-                Repository {
-                    path: PathBuf::from("/test/repo2"),
-                    auto_commit: false, // Disabled
-                    commit_message_template: "Update".to_owned(),
-                },
-                Repository {
-                    path: PathBuf::from("/test/repo3"),
-                    auto_commit: true,
-                    commit_message_template: "Checkpoint".to_owned(),
-                },
-            ],
-        }
-    }
-
     #[tokio::test]
-    async fn test_handle_status_command_empty_config() {
-        let config = Arc::new(RwLock::new(create_test_config()));
-        let start_time = Instant::now();
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let response = handle_status_command(config, start_time, suspended).await;
-
-        assert_eq!(response.status, ResponseStatus::Ok);
-        assert_eq!(response.message, "Daemon status");
-
-        if let Some(ResponseData::Status {
-            uptime_seconds,
-            check_interval_seconds,
-            repositories_count,
-        }) = response.data
-        {
-            assert_eq!(uptime_seconds, 0); // Just started
-            assert_eq!(check_interval_seconds, 300);
-            assert_eq!(repositories_count, 0);
-        } else {
-            panic!("Expected Status response data");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_status_command_with_repos() {
-        let config = Arc::new(RwLock::new(create_test_config_with_repos()));
-        let start_time = Instant::now();
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let response = handle_status_command(config, start_time, suspended).await;
-
-        assert_eq!(response.status, ResponseStatus::Ok);
-
-        if let Some(ResponseData::Status {
-            uptime_seconds,
-            check_interval_seconds,
-            repositories_count,
-        }) = response.data
-        {
-            // uptime_seconds is u64, so it's always >= 0, just verify it exists
-            let _ = uptime_seconds;
-            assert_eq!(check_interval_seconds, 120);
-            assert_eq!(repositories_count, 3);
-        } else {
-            panic!("Expected Status response data");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_status_command_uptime() {
-        let config = Arc::new(RwLock::new(create_test_config()));
-        let start_time = Instant::now() - Duration::from_secs(5);
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let response = handle_status_command(config, start_time, suspended).await;
-
-        if let Some(ResponseData::Status { uptime_seconds, .. }) = response.data {
-            assert!(uptime_seconds >= 5);
-            assert!(uptime_seconds < 10); // Should be around 5 seconds
-        } else {
-            panic!("Expected Status response data");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_trigger_command_empty_config() {
-        let config = Arc::new(RwLock::new(create_test_config()));
-
-        let response = handle_trigger_command(config).await;
-
-        assert_eq!(response.status, ResponseStatus::Ok);
-        assert!(response.message.contains("0 repositories"));
-
-        if let Some(ResponseData::Trigger {
-            repos_checked,
-            repos_committed,
-            details,
-        }) = response.data
-        {
-            assert_eq!(repos_checked, 0);
-            assert_eq!(repos_committed, 0);
-            assert_eq!(details.len(), 0);
-        } else {
-            panic!("Expected Trigger response data");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_trigger_command_skips_disabled_repos() {
-        let config = Arc::new(RwLock::new(create_test_config_with_repos()));
-
-        // This will fail to actually commit (repos don't exist), but we're testing
-        // that it only processes enabled repos
-        let response = handle_trigger_command(config).await;
-
-        assert_eq!(response.status, ResponseStatus::Ok);
-
-        if let Some(ResponseData::Trigger {
-            repos_checked,
-            details,
-            ..
-        }) = response.data
-        {
-            // Should only check repo1 and repo3 (auto_commit=true)
-            // repo2 is disabled (auto_commit=false)
-            assert_eq!(repos_checked, 2);
-            assert_eq!(details.len(), 2);
-
-            // Verify the paths are correct
-            assert_eq!(details[0].path, PathBuf::from("/test/repo1"));
-            assert_eq!(details[1].path, PathBuf::from("/test/repo3"));
-        } else {
-            panic!("Expected Trigger response data");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_trigger_command_response_format() {
-        let config = Arc::new(RwLock::new(create_test_config_with_repos()));
-
-        let response = handle_trigger_command(config).await;
-
-        assert_eq!(response.status, ResponseStatus::Ok);
-        assert!(response.message.contains("Checked"));
-        assert!(response.message.contains("repositories"));
-        assert!(response.data.is_some());
-    }
-
-    #[test]
-    #[serial]
-    fn test_cleanup_socket_no_socket() {
-        // Setup temp config dir
-        let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
-
-        // Socket doesn't exist, should not error
-        cleanup_socket();
-
-        // Verify it didn't create anything
-        let socket_path = socket_path().unwrap();
-        assert!(!socket_path.exists());
-    }
-
-    #[test]
-    #[serial]
-    fn test_cleanup_socket_removes_existing() {
-        // Setup temp config dir
-        let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
-
-        // Create the socket directory and a fake socket file
-        let socket_path = socket_path().unwrap();
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-        std::fs::write(&socket_path, b"fake socket").unwrap();
-
-        assert!(socket_path.exists());
-
-        // Clean up
-        cleanup_socket();
-
-        // Verify it was removed
-        assert!(!socket_path.exists());
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_create_listener_creates_parent_dir() {
-        // Setup temp config dir
-        let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
-
-        let socket_path = socket_path().unwrap();
-        assert!(!socket_path.exists());
-        assert!(!socket_path.parent().unwrap().exists());
-
-        // Create listener (this will create the directory)
-        let listener = create_listener();
-        assert!(listener.is_ok());
-
-        // Verify parent directory was created
-        assert!(socket_path.parent().unwrap().exists());
-
-        // Cleanup
+    async fn competing_instance_cannot_replace_socket() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let mut owner = SocketOwner::acquire(&path).unwrap();
+        let listener = owner.bind().unwrap();
+        assert!(SocketOwner::acquire(&path).is_err());
+        assert!(UnixStream::connect(&path).await.is_ok());
         drop(listener);
-        cleanup_socket();
+        drop(owner);
+        assert!(!path.exists());
+        assert!(SocketOwner::acquire(&path).is_ok());
     }
 
     #[tokio::test]
-    #[serial]
-    async fn test_create_listener_removes_stale_socket() {
-        // Setup temp config dir
-        let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
-
-        let socket_path = socket_path().unwrap();
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-
-        // Create a stale socket file
-        std::fs::write(&socket_path, b"stale socket").unwrap();
-        assert!(socket_path.exists());
-
-        // Create listener should remove the stale file and create a new one
-        let listener = create_listener();
-        assert!(listener.is_ok());
-
-        // Socket should still exist (as a real socket now)
-        assert!(socket_path.exists());
-
-        // Cleanup
-        drop(listener);
-        cleanup_socket();
+    async fn cleanup_preserves_replacement_socket() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let mut owner = SocketOwner::acquire(&path).unwrap();
+        let listener = owner.bind().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        drop(owner);
+        assert!(path.exists());
+        drop((listener, replacement));
     }
 
     #[tokio::test]
-    async fn test_handle_trigger_different_repo_counts() {
-        // Test with 0 repos
-        let config0 = Arc::new(RwLock::new(create_test_config()));
-        let response0 = handle_trigger_command(config0).await;
-        if let Some(ResponseData::Trigger { repos_checked, .. }) = response0.data {
-            assert_eq!(repos_checked, 0);
-        }
-
-        // Test with 2 enabled repos (out of 3 total)
-        let config2 = Arc::new(RwLock::new(create_test_config_with_repos()));
-        let response2 = handle_trigger_command(config2).await;
-        if let Some(ResponseData::Trigger { repos_checked, .. }) = response2.data {
-            assert_eq!(repos_checked, 2);
-        }
-
-        // Test with all repos enabled
-        let mut config_all = create_test_config_with_repos();
-        config_all.repositories[1].auto_commit = true; // Enable repo2
-        let config_all = Arc::new(RwLock::new(config_all));
-        let response_all = handle_trigger_command(config_all).await;
-        if let Some(ResponseData::Trigger { repos_checked, .. }) = response_all.data {
-            assert_eq!(repos_checked, 3);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_status_different_intervals() {
-        let intervals = vec![1, 60, 120, 300, 600, 3600];
-
-        for interval in intervals {
-            let mut config = create_test_config();
-            config.daemon.check_interval_seconds = interval;
-            let config = Arc::new(RwLock::new(config));
-            let start_time = Instant::now();
-            let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            let response = handle_status_command(config, start_time, suspended).await;
-
-            if let Some(ResponseData::Status {
-                check_interval_seconds,
-                ..
-            }) = response.data
-            {
-                assert_eq!(check_interval_seconds, interval);
-            } else {
-                panic!("Expected Status response data");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_response_messages() {
-        // Test status message
-        let config = Arc::new(RwLock::new(create_test_config()));
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let response = handle_status_command(config.clone(), Instant::now(), suspended).await;
-        assert_eq!(response.message, "Daemon status");
-
-        // Test trigger message format
-        let response = handle_trigger_command(config).await;
-        assert!(response.message.starts_with("Checked"));
-        assert!(response.message.contains("repositories"));
-        assert!(response.message.contains("committed changes in"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_suspend_command() {
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Initially not suspended
-        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
-
-        // Suspend the daemon
-        let response = handle_suspend_command(suspended.clone()).await;
-        assert_eq!(response.status, ResponseStatus::Ok);
-        assert_eq!(response.message, "Daemon suspended");
-
-        // Verify it's now suspended
-        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn test_handle_resume_command() {
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        // Initially suspended
-        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
-
-        // Resume the daemon
-        let response = handle_resume_command(suspended.clone()).await;
-        assert_eq!(response.status, ResponseStatus::Ok);
-        assert_eq!(response.message, "Daemon resumed");
-
-        // Verify it's no longer suspended
-        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn test_suspend_already_suspended() {
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        // Already suspended
-        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
-
-        // Suspend again (should be idempotent)
-        let response = handle_suspend_command(suspended.clone()).await;
-        assert_eq!(response.status, ResponseStatus::Ok);
-
-        // Still suspended
-        assert!(suspended.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn test_resume_already_running() {
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Already running (not suspended)
-        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
-
-        // Resume again (should be idempotent)
-        let response = handle_resume_command(suspended.clone()).await;
-        assert_eq!(response.status, ResponseStatus::Ok);
-
-        // Still running
-        assert!(!suspended.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn test_status_command_when_suspended() {
-        let config = Arc::new(RwLock::new(create_test_config()));
-        let suspended = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        let response = handle_status_command(config, Instant::now(), suspended).await;
-        assert_eq!(response.status, ResponseStatus::Ok);
-        assert_eq!(response.message, "Daemon status (suspended)");
-
-        // Check that response includes status data
-        if let Some(ResponseData::Status {
-            uptime_seconds: _,
-            check_interval_seconds,
-            repositories_count,
-        }) = response.data
-        {
-            assert_eq!(check_interval_seconds, 300); // From create_test_config()
-            assert_eq!(repositories_count, 0); // No repos in test config
-        } else {
-            panic!("Expected Status response data");
-        }
+    async fn stale_socket_is_replaced_but_regular_file_is_preserved() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("daemon.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let mut owner = SocketOwner::acquire(&path).unwrap();
+        drop(owner.bind().unwrap());
+        drop(owner);
+        std::fs::write(&path, "valuable content").unwrap();
+        let mut owner = SocketOwner::acquire(&path).unwrap();
+        assert!(owner.bind().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "valuable content");
     }
 }
