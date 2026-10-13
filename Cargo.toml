@@ -38,7 +38,6 @@ tokio = { version = "1.52", features = ["full"] }
 
 # Tests
 tempfile = "3.27"
-serial_test = "3.4"
 
 [profile.release]
 strip = true

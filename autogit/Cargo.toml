@@ -28,7 +28,6 @@ tabled = "0.20.0"
 
 [dev-dependencies]
 tempfile.workspace = true
-serial_test.workspace = true
 
 [build-dependencies]
 clap = { workspace = true }
