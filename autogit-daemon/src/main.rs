@@ -5,9 +5,10 @@ mod tray;
 
 use anyhow::{Context, Result};
 use autogit_shared::{Config, RepoDetail};
-use coordinator::{Coordinator, CycleOutcome};
+use coordinator::Coordinator;
 use notify::{Event, RecursiveMode, Watcher};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ async fn main() -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())?;
     let listener = owner.bind()?;
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
-    let _watcher = watch_config(&config_path, reload_tx)?;
+    let mut watcher = ConfigWatcher::new(&config_path, reload_tx)?;
     // Cover a replacement between the initial load and establishing the directory watch.
     if let Ok(latest) = Config::load(&config_path) {
         *config.write().await = latest;
@@ -75,6 +76,9 @@ async fn main() -> Result<()> {
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
             _ = interval.tick() => coordinator.schedule(None),
             Some(()) = reload_rx.recv() => {
+                if let Err(error) = watcher.refresh() {
+                    error!(%error, "Configuration watch refresh failed");
+                }
                 match Config::load(&config_path) {
                     Ok(updated) => {
                         let old = config.read().await.clone();
@@ -112,23 +116,60 @@ fn make_interval(seconds: u64) -> tokio::time::Interval {
     interval
 }
 
+struct ConfigWatcher {
+    path: PathBuf,
+    reload: mpsc::Sender<()>,
+    watcher: notify::RecommendedWatcher,
+}
+
+impl ConfigWatcher {
+    fn new(path: &Path, reload: mpsc::Sender<()>) -> Result<Self> {
+        let watcher = watch_config(path, reload.clone())?;
+        Ok(Self {
+            path: path.to_owned(),
+            reload,
+            watcher,
+        })
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        // Install new watches before dropping old ones so link retargets do not leave a gap.
+        self.watcher = watch_config(&self.path, self.reload.clone())?;
+        Ok(())
+    }
+}
+
 fn watch_config(path: &Path, reload: mpsc::Sender<()>) -> Result<notify::RecommendedWatcher> {
-    let target = path.to_owned();
+    // Watch each link and the target, including ancestor replacement or creation.
+    let targets = Config::watch_paths(path)?
+        .into_iter()
+        .flat_map(|path| {
+            path.ancestors()
+                .filter(|ancestor| ancestor.parent().is_some())
+                .map(Path::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>();
+    let directories = targets
+        .iter()
+        .filter_map(|target| target.parent())
+        .filter(|directory| directory.is_dir())
+        .map(Path::to_owned)
+        .collect::<HashSet<_>>();
     let mut watcher =
         notify::recommended_watcher(move |event: Result<Event, notify::Error>| match event {
             Ok(event)
-                if event.paths.iter().any(|path| path == &target) && !event.kind.is_access() =>
+                if !event.kind.is_access()
+                    && event.paths.iter().any(|path| targets.contains(path)) =>
             {
-                // Coalesce events without blocking the notify thread.
                 let _ = reload.try_send(());
             }
             Err(error) => error!(%error, "Configuration watch failed"),
             _ => {}
         })?;
-    watcher.watch(
-        path.parent().context("Configuration path has no parent")?,
-        RecursiveMode::NonRecursive,
-    )?;
+    for directory in directories {
+        watcher.watch(&directory, RecursiveMode::NonRecursive)?;
+    }
     Ok(watcher)
 }
 
@@ -151,7 +192,6 @@ async fn manage_tray(
     let mut handle: Option<ksni::Handle<tray::AutogitTray>> = None;
     let mut retries = 0;
     let mut next_retry = Instant::now();
-    let mut cycles = 0;
     loop {
         tokio::select! {
             _ = stop.changed() => { if *stop.borrow() { break; } }
@@ -193,8 +233,6 @@ async fn manage_tray(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let completed = state.completed_cycles != cycles;
-            cycles = state.completed_cycles;
             let error_count = active_error_count(&config, &details);
             let _ = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -203,12 +241,11 @@ async fn manage_tray(
                     tray.set_repo_count(config.repositories.len());
                     tray.set_check_interval(config.daemon.check_interval_seconds);
                     tray.set_error_count(error_count);
+                    tray.set_last_sync(state.last_successful_sync);
                     if state.syncing {
                         tray.set_status(tray::TrayStatus::Syncing);
                     } else if error_count > 0 {
                         tray.set_status(tray::TrayStatus::Error);
-                    } else if completed && state.last_cycle == Some(CycleOutcome::Succeeded) {
-                        tray.set_last_sync();
                     } else {
                         tray.set_status(tray::TrayStatus::Idle);
                     }
@@ -300,6 +337,50 @@ mod tests {
             shutdown_tray(handle).await;
             assert!(witness.is_closed());
         }
+    }
+
+    #[tokio::test]
+    async fn watcher_follows_multihop_links_and_retargets() {
+        use std::os::unix::fs::symlink;
+        let directory = TempDir::new().unwrap();
+        let alias = directory.path().join("alias");
+        let middle = directory.path().join("middle");
+        let first_dir = directory.path().join("first");
+        let second_dir = directory.path().join("second");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let first = first_dir.join("config.toml");
+        let second = second_dir.join("config.toml");
+        std::fs::write(&first, "initial").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        symlink(&middle, &alias).unwrap();
+        symlink(&first, &middle).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut watcher = ConfigWatcher::new(&alias, sender).unwrap();
+        let replacement = first_dir.join("temporary");
+        std::fs::write(&replacement, "replacement").unwrap();
+        std::fs::rename(&replacement, &first).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        watcher.refresh().unwrap();
+        let new_link = directory.path().join("new_link");
+        symlink(&second, &new_link).unwrap();
+        std::fs::rename(&new_link, &middle).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        watcher.refresh().unwrap();
+        // Drain already coalesced replacement events before checking the new target.
+        while receiver.try_recv().is_ok() {}
+        std::fs::write(&second, "updated").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "updated");
     }
 
     #[tokio::test]

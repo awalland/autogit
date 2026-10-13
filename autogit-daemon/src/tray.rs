@@ -77,11 +77,9 @@ impl AutogitTray {
     }
 
     /// Update last sync time
-    pub fn set_last_sync(&self) {
+    pub fn set_last_sync(&self, last_sync: Option<Instant>) {
         let mut state = self.status.write().unwrap();
-        state.last_sync = Some(Instant::now());
-        state.status = TrayStatus::Idle;
-        state.error_count = 0;
+        state.last_sync = last_sync;
     }
 
     /// Reflect current repository errors rather than accumulating past failures.
@@ -443,6 +441,7 @@ fn create_pause_icon() -> (i32, i32, Vec<u8>) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     fn create_test_tray() -> (AutogitTray, mpsc::Receiver<TrayAction>) {
         let (tx, rx) = mpsc::channel(10);
@@ -486,13 +485,12 @@ mod tests {
         assert!(tray.get_state().last_sync.is_none());
         tray.set_error_count(1);
 
-        tray.set_last_sync();
+        let completed = Instant::now() - Duration::from_secs(60);
+        tray.set_last_sync(Some(completed));
 
         let state = tray.get_state();
-        assert!(state.last_sync.is_some());
-        assert_eq!(state.status, TrayStatus::Idle);
-        assert_eq!(state.error_count, 0);
-        assert!(tray.attention_icon_pixmap().is_empty());
+        assert_eq!(state.last_sync, Some(completed));
+        assert_eq!(state.error_count, 1);
     }
 
     #[test]
