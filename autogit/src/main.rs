@@ -55,9 +55,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autogit_shared::test_support::set_env_var;
     use clap::Parser;
-    use serial_test::serial;
     use tempfile::TempDir;
 
     #[test]
@@ -156,7 +154,7 @@ mod tests {
     #[test]
     fn test_cli_parse_list() {
         let cli = Cli::parse_from(["autogit", "list"]);
-        matches!(cli.command, Commands::List);
+        assert!(matches!(cli.command, Commands::List));
     }
 
     #[test]
@@ -206,39 +204,38 @@ mod tests {
     #[test]
     fn test_cli_parse_status() {
         let cli = Cli::parse_from(["autogit", "status"]);
-        matches!(cli.command, Commands::Status);
+        assert!(matches!(cli.command, Commands::Status));
     }
 
     #[test]
     fn test_cli_parse_edit() {
         let cli = Cli::parse_from(["autogit", "edit"]);
-        matches!(cli.command, Commands::Edit);
+        assert!(matches!(cli.command, Commands::Edit));
     }
 
     #[test]
     fn test_cli_parse_now() {
         let cli = Cli::parse_from(["autogit", "now"]);
-        matches!(cli.command, Commands::Now);
+        assert!(matches!(cli.command, Commands::Now));
     }
 
     #[test]
     fn test_cli_parse_suspend() {
         let cli = Cli::parse_from(["autogit", "suspend"]);
-        matches!(cli.command, Commands::Suspend);
+        assert!(matches!(cli.command, Commands::Suspend));
     }
 
     #[test]
     fn test_cli_parse_resume() {
         let cli = Cli::parse_from(["autogit", "resume"]);
-        matches!(cli.command, Commands::Resume);
+        assert!(matches!(cli.command, Commands::Resume));
     }
 
     // Integration tests that execute main logic
     #[test]
-    #[serial]
     fn test_main_add_command() {
         let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
+        let config_path = temp_dir.path().join("config.toml");
 
         // Create a temp git repo
         let repo_dir = temp_dir.path().join("test_repo");
@@ -250,41 +247,39 @@ mod tests {
             .unwrap();
 
         // Test add command through CLI parsing
-        let result = commands::add_repository(&repo_dir.to_string_lossy(), None, None);
+        let result =
+            commands::add_repository_at(&config_path, &repo_dir.to_string_lossy(), None, None);
         assert!(result.is_ok());
     }
 
     #[test]
-    #[serial]
     fn test_main_list_command() {
         let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
+        let config_path = temp_dir.path().join("config.toml");
 
         // Should work even with no config
-        let result = commands::list_repositories();
+        let result = commands::list_repositories_at(&config_path);
         assert!(result.is_ok());
     }
 
     #[test]
-    #[serial]
     fn test_main_interval_command() {
         let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
+        let config_path = temp_dir.path().join("config.toml");
 
         // Test showing interval
-        let result = commands::set_interval(None);
+        let result = commands::set_interval_at(&config_path, None);
         assert!(result.is_ok());
 
         // Test setting interval
-        let result = commands::set_interval(Some(600));
+        let result = commands::set_interval_at(&config_path, Some(600));
         assert!(result.is_ok());
     }
 
     #[test]
-    #[serial]
     fn test_main_enable_disable_commands() {
         let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
+        let config_path = temp_dir.path().join("config.toml");
 
         // Create a test repo
         let repo_dir = temp_dir.path().join("test_repo");
@@ -296,22 +291,23 @@ mod tests {
             .unwrap();
 
         // Add it first
-        commands::add_repository(&repo_dir.to_string_lossy(), None, None).unwrap();
+        commands::add_repository_at(&config_path, &repo_dir.to_string_lossy(), None, None).unwrap();
 
         // Test disable
-        let result = commands::disable_repository(&repo_dir.to_string_lossy());
+        let result =
+            commands::update_repository_status_at(&config_path, &repo_dir.to_string_lossy(), false);
         assert!(result.is_ok());
 
         // Test enable
-        let result = commands::enable_repository(&repo_dir.to_string_lossy());
+        let result =
+            commands::update_repository_status_at(&config_path, &repo_dir.to_string_lossy(), true);
         assert!(result.is_ok());
     }
 
     #[test]
-    #[serial]
     fn test_main_remove_command() {
         let temp_dir = TempDir::new().unwrap();
-        set_env_var("XDG_CONFIG_HOME", temp_dir.path());
+        let config_path = temp_dir.path().join("config.toml");
 
         // Create a test repo
         let repo_dir = temp_dir.path().join("test_repo");
@@ -323,10 +319,10 @@ mod tests {
             .unwrap();
 
         // Add it first
-        commands::add_repository(&repo_dir.to_string_lossy(), None, None).unwrap();
+        commands::add_repository_at(&config_path, &repo_dir.to_string_lossy(), None, None).unwrap();
 
         // Test remove
-        let result = commands::remove_repository(&repo_dir.to_string_lossy());
+        let result = commands::remove_repository_at(&config_path, &repo_dir.to_string_lossy());
         assert!(result.is_ok());
     }
 }

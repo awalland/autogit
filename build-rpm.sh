@@ -1,104 +1,57 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Build script for creating autogit RPM package
-
-PACKAGE_NAME="autogit"
-RELEASE="1"
-
-# Get the absolute path to the project directory
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$PROJECT_DIR"
-
-# Extract version from Cargo.toml
-VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-
-if [ -z "$VERSION" ]; then
-    echo >&2 "Error: Could not extract version from Cargo.toml"
-    exit 1
+build_mode=-ba
+case "${1:-}" in
+    "") ;;
+    --source-only) build_mode=-bs ;;
+    *) echo "Usage: $0 [--source-only]" >&2; exit 2 ;;
+esac
+if (( $# > 1 )); then
+    echo "Usage: $0 [--source-only]" >&2
+    exit 2
 fi
 
-echo "==================================="
-echo "Building ${PACKAGE_NAME} RPM v${VERSION}-${RELEASE}"
-echo "==================================="
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for tool in cargo rpmbuild python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "Error: $tool is required to build the RPM." >&2
+        exit 1
+    fi
+done
 
-# Check for required tools
-command -v rpmbuild >/dev/null 2>&1 || {
-    echo >&2 "Error: rpmbuild is required but not installed."
-    echo >&2 "Install it with: sudo dnf install rpm-build rpmdevtools"
-    exit 1
-}
+version=$(python3 - "$project_dir/Cargo.toml" <<'PYTHON'
+import sys
+import tomllib
 
-command -v cargo >/dev/null 2>&1 || {
-    echo >&2 "Error: cargo is required but not installed."
-    echo >&2 "Install Rust from: https://rustup.rs/"
-    exit 1
-}
+with open(sys.argv[1], "rb") as manifest:
+    print(tomllib.load(manifest)["workspace"]["package"]["version"])
+PYTHON
+)
+rpmbuild_dir="${AUTOGIT_RPMBUILD_DIR:-$HOME/rpmbuild}"
+mkdir -p "$rpmbuild_dir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+rpmbuild_dir="$(cd "$rpmbuild_dir" && pwd)"
 
-echo "Project directory: $PROJECT_DIR"
+temporary_dir=$(mktemp -d)
+trap 'rm -rf "$temporary_dir"' EXIT
+package_dir="$temporary_dir/autogit-$version"
+mkdir -p "$package_dir/.cargo"
+cp -a "$project_dir/autogit" "$project_dir/autogit-daemon" "$project_dir/autogit-shared" "$package_dir/"
+cp "$project_dir/Cargo.toml" "$project_dir/README.md" "$project_dir/LICENSE" \
+    "$project_dir/autogit-daemon.service" "$package_dir/"
+if [[ -f "$project_dir/Cargo.lock" ]]; then
+    cp "$project_dir/Cargo.lock" "$package_dir/"
+else
+    cargo generate-lockfile --manifest-path "$package_dir/Cargo.toml"
+fi
 
-# Set up RPM build directories
-RPMBUILD_DIR="$HOME/rpmbuild"
-echo "Setting up RPM build directories in: $RPMBUILD_DIR"
-mkdir -p "$RPMBUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+# Include dependencies so the source RPM can build without network access.
+cargo vendor --locked --manifest-path "$package_dir/Cargo.toml" \
+    "$package_dir/vendor" > "$package_dir/.cargo/config.toml"
+tar -czf "$rpmbuild_dir/SOURCES/autogit-$version.tar.gz" \
+    -C "$temporary_dir" "autogit-$version"
+sed "s|^Version:.*|Version:        $version|" "$project_dir/autogit.spec" \
+    > "$rpmbuild_dir/SPECS/autogit.spec"
 
-# Create source tarball
-TARBALL_NAME="${PACKAGE_NAME}-${VERSION}.tar.gz"
-TARBALL_PATH="$RPMBUILD_DIR/SOURCES/$TARBALL_NAME"
-
-echo "Creating source tarball: $TARBALL_NAME"
-
-# Create a temporary directory for the tarball
-TEMP_DIR=$(mktemp -d)
-PACKAGE_DIR="$TEMP_DIR/${PACKAGE_NAME}-${VERSION}"
-
-# Copy project files to temp directory
-mkdir -p "$PACKAGE_DIR"
-cp -r autogit autogit-daemon autogit-shared "$PACKAGE_DIR/"
-cp Cargo.toml Cargo.lock "$PACKAGE_DIR/" 2>/dev/null || cp Cargo.toml "$PACKAGE_DIR/"
-cp README.md LICENSE autogit-daemon.service "$PACKAGE_DIR/"
-
-# Create the tarball
-cd "$TEMP_DIR"
-tar czf "$TARBALL_PATH" "${PACKAGE_NAME}-${VERSION}"
-cd "$PROJECT_DIR"
-
-# Clean up temp directory
-rm -rf "$TEMP_DIR"
-
-echo "Source tarball created: $TARBALL_PATH"
-
-# Copy spec file to SPECS directory and update version
-echo "Copying spec file and updating version to $VERSION"
-sed "s|^Version:.*|Version:        $VERSION|" autogit.spec > "$RPMBUILD_DIR/SPECS/autogit.spec"
-
-# Build the RPM
-echo ""
-echo "Building RPM..."
-echo "This may take a few minutes as Rust dependencies are downloaded and compiled..."
-echo ""
-
-rpmbuild -ba --nodeps "$RPMBUILD_DIR/SPECS/autogit.spec"
-
-# Find the built RPM
-RPM_ARCH=$(uname -m)
-RPM_FILE=$(find "$RPMBUILD_DIR/RPMS/$RPM_ARCH" -name "${PACKAGE_NAME}-${VERSION}-${RELEASE}*.rpm" | head -n 1)
-SRPM_FILE=$(find "$RPMBUILD_DIR/SRPMS" -name "${PACKAGE_NAME}-${VERSION}-${RELEASE}*.src.rpm" | head -n 1)
-
-echo ""
-echo "==================================="
-echo "Build completed successfully!"
-echo "==================================="
-echo ""
-echo "RPM package:  $RPM_FILE"
-echo "Source RPM:   $SRPM_FILE"
-echo ""
-echo "To install the RPM:"
-echo "  sudo rpm -ivh $RPM_FILE"
-echo ""
-echo "Or with DNF:"
-echo "  sudo dnf install $RPM_FILE"
-echo ""
-echo "To uninstall:"
-echo "  sudo rpm -e $PACKAGE_NAME"
-echo ""
+rpmbuild "$build_mode" --define "_topdir $rpmbuild_dir" "$rpmbuild_dir/SPECS/autogit.spec"
+echo "RPM artifacts: $rpmbuild_dir/RPMS and $rpmbuild_dir/SRPMS"
