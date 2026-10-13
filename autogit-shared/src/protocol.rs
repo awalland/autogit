@@ -59,6 +59,10 @@ pub enum ResponseData {
         uptime_seconds: u64,
         check_interval_seconds: u64,
         repositories_count: usize,
+        config: crate::Config,
+        suspended: bool,
+        syncing: bool,
+        details: Vec<RepoDetail>,
     },
 }
 
@@ -320,6 +324,10 @@ mod tests {
             uptime_seconds: 3600,
             check_interval_seconds: 300,
             repositories_count: 5,
+            config: crate::Config::default(),
+            suspended: false,
+            syncing: false,
+            details: vec![],
         };
 
         let resp = Response::ok_with_data("Status", data);
@@ -330,6 +338,7 @@ mod tests {
             uptime_seconds,
             check_interval_seconds,
             repositories_count,
+            ..
         }) = parsed.data
         {
             assert_eq!(uptime_seconds, 3600);
@@ -410,6 +419,10 @@ mod tests {
                     uptime_seconds: 0,
                     check_interval_seconds: 60,
                     repositories_count: 0,
+                    config: crate::Config::default(),
+                    suspended: false,
+                    syncing: false,
+                    details: vec![],
                 },
             ),
         ];

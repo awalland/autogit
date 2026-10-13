@@ -100,7 +100,6 @@ impl AutogitTray {
     pub fn update_repo_details(&self, details: Vec<RepoDetail>) {
         let mut state = self.status.write().unwrap();
         state.repo_details = details;
-        state.repo_count = state.repo_details.len();
     }
 
     /// Set the check interval in seconds
@@ -777,7 +776,7 @@ mod tests {
 
         let state = tray.get_state();
         assert_eq!(state.repo_details.len(), 2);
-        assert_eq!(state.repo_count, 2);
+        assert_eq!(state.repo_count, 3);
         assert_eq!(
             state.repo_details[0].path,
             PathBuf::from("/home/user/repo1")
