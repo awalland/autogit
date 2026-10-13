@@ -14,6 +14,14 @@ pub struct SyncState {
     pub syncing: bool,
     pub details: Vec<RepoDetail>,
     pub completed_cycles: u64,
+    pub last_cycle: Option<CycleOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleOutcome {
+    Succeeded,
+    Failed,
+    Interrupted,
 }
 
 struct Request {
@@ -228,6 +236,13 @@ impl Coordinator {
                     }
                 }
                 state.completed_cycles += 1;
+                state.last_cycle = Some(if interrupted {
+                    CycleOutcome::Interrupted
+                } else if failed {
+                    CycleOutcome::Failed
+                } else {
+                    CycleOutcome::Succeeded
+                });
             });
             *self.active_cancel.lock().unwrap() = None;
             info!(failed, committed, "Repository sync cycle finished");
@@ -400,6 +415,10 @@ mod tests {
         permits.add_permits(1);
         second.await.unwrap();
         assert_eq!(coordinator.state.borrow().completed_cycles, 2);
+        assert_eq!(
+            coordinator.state.borrow().last_cycle,
+            Some(CycleOutcome::Failed)
+        );
         assert!(coordinator.state.borrow().details[0].error.is_some());
         coordinator.shutdown();
         worker.await.unwrap();
@@ -456,6 +475,10 @@ mod tests {
             ResponseStatus::Ok
         );
         assert_eq!(sync.await.unwrap().status, ResponseStatus::Error);
+        assert_eq!(
+            coordinator.state.borrow().last_cycle,
+            Some(CycleOutcome::Interrupted)
+        );
         assert!(entered.try_recv().is_err());
         config.write().await.repositories.push(repository("/new"));
         coordinator.schedule(Some(vec![PathBuf::from("/new")]));

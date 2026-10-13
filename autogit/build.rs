@@ -32,10 +32,5 @@ fn main() -> Result<(), Error> {
     fs::copy(&zsh_path, completions_dir.join("_autogit"))?;
     fs::copy(&fish_path, completions_dir.join("autogit.fish"))?;
 
-    println!(
-        "cargo:warning=Completions generated in {:?}",
-        completions_dir
-    );
-
     Ok(())
 }

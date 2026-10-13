@@ -6,7 +6,7 @@ use autogit_shared::{
 use colored::Colorize;
 use std::path::{Component, Path, PathBuf};
 use tabled::{
-    Table, Tabled,
+    builder::Builder,
     settings::{Modify, Style, Width, object::Columns},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -112,31 +112,21 @@ pub(crate) fn list_repositories_at(config_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    #[derive(Tabled)]
-    struct RepoRow {
-        #[tabled(rename = "Status")]
-        status: String,
-        #[tabled(rename = "Path")]
-        path: String,
-        #[tabled(rename = "Commit Message Template")]
-        message: String,
-    }
-
-    let rows: Vec<RepoRow> = config
-        .repositories
-        .iter()
-        .map(|r| RepoRow {
-            status: if r.auto_commit {
+    let mut builder = Builder::default();
+    builder.push_record(["Status", "Path", "Commit Message Template"]);
+    for repository in &config.repositories {
+        builder.push_record([
+            if repository.auto_commit {
                 "✓ Enabled".to_owned()
             } else {
                 "✗ Disabled".to_owned()
             },
-            path: r.path.display().to_string(),
-            message: r.commit_message_template.clone(),
-        })
-        .collect();
+            repository.path.display().to_string(),
+            repository.commit_message_template.clone(),
+        ]);
+    }
 
-    let mut table = Table::new(rows);
+    let mut table = builder.build();
     table
         .with(Style::rounded())
         .with(Modify::new(Columns::new(0..1)).with(Width::truncate(11).suffix("")))
