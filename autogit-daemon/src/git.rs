@@ -1,11 +1,20 @@
 use anyhow::{Context, Result, bail};
 use autogit_shared::Repository;
 use chrono::Local;
-use git2::{IndexAddOption, Repository as GitRepository, Signature, Status, StatusOptions};
-use notify_rust::Notification;
+use git2::{
+    IndexAddOption, Repository as GitRepository, RepositoryState, Signature, Status, StatusOptions,
+};
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
-use tracing::{debug, info, warn};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 /// Open a git repository with user-friendly error messages
 fn open_repository(path: &Path) -> Result<GitRepository> {
@@ -26,286 +35,248 @@ fn open_repository(path: &Path) -> Result<GitRepository> {
     }
 }
 
-/// Push commits to remote
-/// Returns true if push was successful, false if skipped or failed
-fn push_changes(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
-    // Check if remote exists
-    let has_remote = match repo.find_remote("origin") {
-        Ok(_) => true,
-        Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            debug!(
-                "No remote 'origin' configured for {}, skipping push",
-                repo_path.display()
-            );
-            return Ok(false);
-        }
-        Err(e) => return Err(e.into()),
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationOutcome {
+    Succeeded,
+    Skipped,
+    Failed(String),
+}
 
-    if !has_remote {
-        return Ok(false);
+#[derive(Debug, Clone)]
+pub struct SyncOutcome {
+    pub committed: bool,
+    pub files_changed: Option<usize>,
+    pub pull: OperationOutcome,
+    pub push: OperationOutcome,
+}
+
+impl SyncOutcome {
+    pub fn error_message(&self) -> Option<String> {
+        let errors: Vec<_> = [("pull", &self.pull), ("push", &self.push)]
+            .into_iter()
+            .filter_map(|(operation, outcome)| match outcome {
+                OperationOutcome::Failed(message) => Some(format!("{operation}: {message}")),
+                _ => None,
+            })
+            .collect();
+        (!errors.is_empty()).then(|| errors.join("; "))
     }
+}
 
-    // Check if there are unpushed commits by comparing local branch with its upstream
-    let has_unpushed_commits = match repo.head() {
-        Ok(head) => {
-            if let Some(branch_name) = head.shorthand() {
-                // Try to find the upstream branch
-                match repo.find_branch(branch_name, git2::BranchType::Local) {
-                    Ok(branch) => {
-                        match branch.upstream() {
-                            Ok(upstream) => {
-                                // Compare local and upstream commits
-                                let local_oid = head.target();
-                                let upstream_oid = upstream.get().target();
-                                local_oid != upstream_oid
-                            }
-                            Err(_) => {
-                                // No upstream configured, assume we need to push
-                                true
-                            }
-                        }
-                    }
-                    Err(_) => true,
-                }
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn ensure_available(repo: &GitRepository, cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        bail!("Repository synchronisation cancelled");
+    }
+    if repo.state() != RepositoryState::Clean || repo.index()?.has_conflicts() {
+        bail!(
+            "Repository has an active Git operation or unresolved conflicts; leaving it untouched"
+        );
+    }
+    Ok(())
+}
+
+// A separate process group lets shutdown terminate Git's SSH/credential-helper children too.
+fn terminate_process(child: &mut Child) -> Result<()> {
+    let process_group = i32::try_from(child.id()).context("Git process ID is out of range")?;
+    // SAFETY: the child was placed in its own process group before spawning.
+    unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    let _ = child.kill();
+    child.wait().context("Failed to reap Git process")?;
+    Ok(())
+}
+
+fn read_command_output(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    stream.by_ref().take(64 * 1024).read_to_end(&mut captured)?;
+    std::io::copy(&mut stream, &mut std::io::sink())?;
+    Ok(captured)
+}
+
+fn run_command(mut command: Command, cancelled: &AtomicBool, timeout: Duration) -> Result<Output> {
+    if cancelled.load(Ordering::Relaxed) {
+        bail!("Git operation cancelled");
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().context("Failed to start Git command")?;
+    let stdout = child.stdout.take().context("Missing Git stdout")?;
+    let stderr = child.stderr.take().context("Missing Git stderr")?;
+    let stdout_reader = thread::spawn(move || read_command_output(stdout));
+    let stderr_reader = thread::spawn(move || read_command_output(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            terminate_process(&mut child)?;
+            break Err(anyhow::anyhow!("Git operation cancelled"));
+        }
+        if started.elapsed() >= timeout {
+            terminate_process(&mut child)?;
+            break Err(anyhow::anyhow!(
+                "Git operation timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                terminate_process(&mut child)?;
+                break Err(error.into());
+            }
+        }
+    };
+    // A command may exit while a helper still holds its output pipes open.
+    // Terminate remaining group members before joining the readers.
+    let process_group = i32::try_from(child.id()).context("Git process ID is out of range")?;
+    // SAFETY: this group was created specifically for the spawned command.
+    unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git stderr reader panicked"))??;
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+fn run_git(repo_path: &Path, arguments: &[&str], cancelled: &AtomicBool) -> OperationOutcome {
+    let mut command = Command::new("git");
+    command
+        .args(arguments)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    match run_command(command, cancelled, GIT_TIMEOUT) {
+        Ok(output) if output.status.success() => OperationOutcome::Succeeded,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = if stderr.trim().is_empty() {
+                format!("git {} exited with {}", arguments.join(" "), output.status)
             } else {
-                // Detached HEAD or other unusual state
-                true
-            }
-        }
-        Err(_) => {
-            // If we can't determine, assume there might be changes
-            true
-        }
-    };
-
-    if !has_unpushed_commits {
-        debug!("Nothing to push for: {}", repo_path.display());
-        return Ok(true);
-    }
-
-    // Run git push using Command
-    debug!("Pushing changes for: {}", repo_path.display());
-
-    let output = Command::new("git")
-        .arg("push")
-        .current_dir(repo_path)
-        .output()
-        .with_context(|| format!("Failed to execute git push for {}", repo_path.display()))?;
-
-    if output.status.success() {
-        info!("Successfully pushed changes: {}", repo_path.display());
-        Ok(true)
-    } else {
-        // Push failed - log but continue (non-fatal)
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("Push failed for {}: {}", repo_path.display(), stderr.trim());
-
-        // Send desktop notification
-        let _ = Notification::new()
-            .summary("Git Push Failed")
-            .body(&format!(
-                "Repository: {}\n\nError:\n{}",
-                repo_path.display(),
-                stderr.trim()
-            ))
-            .appname(env!("CARGO_PKG_NAME"))
-            .show();
-
-        Ok(false)
-    }
-}
-
-/// Pull and rebase from remote
-/// Returns true if pull was successful, false if skipped or failed
-fn pull_rebase(repo: &GitRepository, repo_path: &Path) -> Result<bool> {
-    // Check if remote exists
-    let has_remote = match repo.find_remote("origin") {
-        Ok(_) => true,
-        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                stderr.trim().to_owned()
+            };
             warn!(
-                "No remote 'origin' configured for {}, skipping pull",
-                repo_path.display()
-            );
-            return Ok(false);
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    if !has_remote {
-        return Ok(false);
-    }
-
-    // Get the current HEAD commit before pulling
-    let head_before = repo.head().ok().and_then(|h| h.target());
-
-    // Run git pull --rebase using Command
-    debug!("Pulling changes for: {}", repo_path.display());
-
-    let output = Command::new("git")
-        .arg("pull")
-        .arg("--rebase")
-        .current_dir(repo_path)
-        .output()
-        .with_context(|| format!("Failed to execute git pull for {}", repo_path.display()))?;
-
-    if output.status.success() {
-        // Re-open the repository to get the updated HEAD
-        let repo_after = GitRepository::open(repo_path)?;
-        let head_after = repo_after.head().ok().and_then(|h| h.target());
-
-        if head_before != head_after && head_after.is_some() {
-            info!("Successfully pulled and rebased: {}", repo_path.display());
-        } else {
-            debug!("Repository already up to date: {}", repo_path.display());
-        }
-        Ok(true)
-    } else {
-        // Pull failed - try to abort rebase to clean up
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            "Pull --rebase failed for {}: {}",
-            repo_path.display(),
-            stderr.trim()
-        );
-
-        // Send desktop notification
-        let _ = Notification::new()
-            .summary("Git Pull Failed")
-            .body(&format!(
-                "Repository: {}\n\nError:\n{}",
+                "Git {} failed for {}: {}",
+                arguments.join(" "),
                 repo_path.display(),
-                stderr.trim()
-            ))
-            .appname(env!("CARGO_PKG_NAME"))
-            .show();
-
-        // Try to abort the rebase to leave repo in clean state
-        let abort_result = Command::new("git")
-            .arg("rebase")
-            .arg("--abort")
-            .current_dir(repo_path)
-            .output();
-
-        match abort_result {
-            Ok(abort_output) if abort_output.status.success() => {
-                debug!("Aborted rebase for {}", repo_path.display());
-            }
-            Ok(abort_output) => {
-                let abort_stderr = String::from_utf8_lossy(&abort_output.stderr);
-                debug!(
-                    "Rebase abort produced output for {}: {}",
-                    repo_path.display(),
-                    abort_stderr.trim()
-                );
-            }
-            Err(e) => {
-                warn!("Failed to abort rebase for {}: {}", repo_path.display(), e);
-            }
-        }
-
-        // Return Ok(false) to indicate we should continue (non-fatal error)
-        Ok(false)
-    }
-}
-
-/// Initialize a repository on daemon startup
-/// Commits any pending changes and pulls from remote
-pub async fn initialize_repository(repo_config: &Repository) -> Result<()> {
-    tokio::task::spawn_blocking({
-        let repo_config = repo_config.clone();
-        move || initialize_repository_sync(&repo_config)
-    })
-    .await
-    .context("Task panicked")??;
-
-    Ok(())
-}
-
-fn initialize_repository_sync(repo_config: &Repository) -> Result<()> {
-    let repo = open_repository(&repo_config.path)?;
-
-    info!("Initializing repository: {}", repo_config.path.display());
-
-    // Check if there are uncommitted changes
-    if has_changes(&repo)? {
-        info!(
-            "Found uncommitted changes in {}, committing before pull",
-            repo_config.path.display()
-        );
-
-        // Stage all changes
-        stage_all_changes(&repo)?;
-
-        // Check if there are actually staged changes
-        if has_staged_changes(&repo)? {
-            // Create a startup commit
-            let commit_message = "Auto-commit on daemon startup";
-            create_commit(&repo, commit_message)?;
-            info!(
-                "Committed pending changes in {}",
-                repo_config.path.display()
+                message
             );
+            OperationOutcome::Failed(message)
+        }
+        Err(error) => OperationOutcome::Failed(format!("{error:#}")),
+    }
+}
 
-            // Push the commit
-            push_changes(&repo, &repo_config.path)?;
+fn has_origin(repo: &GitRepository) -> Result<bool> {
+    match repo.find_remote("origin") {
+        Ok(_) => Ok(true),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn push_changes(
+    repo: &GitRepository,
+    repo_path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<OperationOutcome> {
+    ensure_available(repo, cancelled)?;
+    if !has_origin(repo)? {
+        return Ok(OperationOutcome::Skipped);
+    }
+    // Always retry unpublished commits, including commits made by an earlier cycle.
+    Ok(run_git(repo_path, &["push"], cancelled))
+}
+
+fn pull_rebase(
+    repo: &GitRepository,
+    repo_path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<OperationOutcome> {
+    ensure_available(repo, cancelled)?;
+    if !has_origin(repo)? {
+        return Ok(OperationOutcome::Skipped);
+    }
+    let mut outcome = run_git(repo_path, &["pull", "--rebase"], cancelled);
+    if let OperationOutcome::Failed(message) = &mut outcome {
+        let repo_after = open_repository(repo_path)?;
+        // The precondition excluded any existing operation. Only abort a rebase
+        // left by this pull, never an unrelated merge/cherry-pick or a user's rebase.
+        if matches!(
+            repo_after.state(),
+            RepositoryState::Rebase
+                | RepositoryState::RebaseInteractive
+                | RepositoryState::RebaseMerge
+        ) {
+            // Cleanup remains bounded even when shutdown cancelled the original command.
+            let mut cleanup = Command::new("git");
+            cleanup.args(["rebase", "--abort"]).current_dir(repo_path);
+            match run_command(cleanup, &AtomicBool::new(false), Duration::from_secs(5)) {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => message.push_str(&format!(
+                    "; rebase cleanup failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => message.push_str(&format!("; rebase cleanup failed: {error:#}")),
+            }
         }
     }
-
-    // Try to pull and rebase
-    pull_rebase(&repo, &repo_config.path)?;
-
-    Ok(())
+    Ok(outcome)
 }
 
-/// Check if a repository has changes and commit them if needed
-/// Returns true if changes were committed, false otherwise
-pub async fn check_and_commit(repo_config: &Repository) -> Result<bool> {
-    // Run blocking git operations in a blocking task
-    let committed = tokio::task::spawn_blocking({
-        let repo_config = repo_config.clone();
-        move || check_and_commit_sync(&repo_config)
-    })
-    .await
-    .context("Task panicked")??;
-
-    Ok(committed)
+pub async fn sync_repository(
+    repo_config: &Repository,
+    cancelled: Arc<AtomicBool>,
+) -> Result<SyncOutcome> {
+    let repo_config = repo_config.clone();
+    tokio::task::spawn_blocking(move || sync_repository_sync(&repo_config, &cancelled))
+        .await
+        .context("Git task panicked")?
 }
 
-fn check_and_commit_sync(repo_config: &Repository) -> Result<bool> {
+fn sync_repository_sync(repo_config: &Repository, cancelled: &AtomicBool) -> Result<SyncOutcome> {
     let repo = open_repository(&repo_config.path)?;
-
-    // Check if there are any changes first
-    let has_local_changes = has_changes(&repo)?;
-
-    let mut committed = false;
-
-    // Commit local changes before pulling to avoid conflicts
-    if has_local_changes {
-        // Stage all changes
+    ensure_available(&repo, cancelled)?;
+    info!("Synchronising repository: {}", repo_config.path.display());
+    let mut outcome = SyncOutcome {
+        committed: false,
+        files_changed: None,
+        pull: OperationOutcome::Skipped,
+        push: OperationOutcome::Skipped,
+    };
+    if has_changes(&repo)? {
+        ensure_available(&repo, cancelled)?;
         stage_all_changes(&repo)?;
-
-        // Check again after staging (in case everything was already staged)
         if has_staged_changes(&repo)? {
-            // Create commit
-            let commit_message = format_commit_message(&repo_config.commit_message_template);
-            create_commit(&repo, &commit_message)?;
+            ensure_available(&repo, cancelled)?;
+            outcome.files_changed = Some(repo.statuses(None)?.len());
+            let message = format_commit_message(&repo_config.commit_message_template);
+            create_commit(&repo, &message)?;
+            outcome.committed = true;
             info!(
                 "Committed changes in {}: {}",
                 repo_config.path.display(),
-                commit_message
+                message
             );
-            committed = true;
-
-            // Push the commit
-            push_changes(&repo, &repo_config.path)?;
         }
     }
-
-    // Now pull and rebase (working directory is clean)
-    let _ = pull_rebase(&repo, &repo_config.path)?;
-
-    Ok(committed)
+    // Integrate remote commits first so a rejected push can recover in this cycle.
+    outcome.pull = pull_rebase(&repo, &repo_config.path, cancelled)
+        .unwrap_or_else(|error| OperationOutcome::Failed(format!("{error:#}")));
+    if !matches!(outcome.pull, OperationOutcome::Failed(_)) {
+        outcome.push = open_repository(&repo_config.path)
+            .and_then(|repo_after| push_changes(&repo_after, &repo_config.path, cancelled))
+            .unwrap_or_else(|error| OperationOutcome::Failed(format!("{error:#}")));
+    }
+    Ok(outcome)
 }
 
 /// Check if repository has any changes (staged or unstaged)
@@ -885,19 +856,29 @@ mod tests {
     #[test]
     fn test_push_changes_no_remote() {
         let (_temp, repo) = create_test_repo();
-        let result = push_changes(&repo, repo.path().parent().unwrap()).unwrap();
-        assert!(!result); // Should return false when no remote
+        let result = push_changes(
+            &repo,
+            repo.path().parent().unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result, OperationOutcome::Skipped);
     }
 
     #[test]
     fn test_pull_rebase_no_remote() {
         let (_temp, repo) = create_test_repo();
-        let result = pull_rebase(&repo, repo.path().parent().unwrap()).unwrap();
-        assert!(!result); // Should return false when no remote
+        let result = pull_rebase(
+            &repo,
+            repo.path().parent().unwrap(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result, OperationOutcome::Skipped);
     }
 
     #[tokio::test]
-    async fn test_check_and_commit_no_changes() {
+    async fn test_sync_repository_no_changes() {
         let (temp, repo) = create_test_repo();
         write_test_file(temp.path(), "test.txt", "content");
 
@@ -912,12 +893,14 @@ mod tests {
             commit_message_template: "Auto: {timestamp}".to_owned(),
         };
 
-        let committed = check_and_commit(&repo_config).await.unwrap();
-        assert!(!committed);
+        let committed = sync_repository(&repo_config, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(!committed.committed);
     }
 
     #[tokio::test]
-    async fn test_check_and_commit_with_changes() {
+    async fn test_sync_repository_with_changes() {
         let (temp, repo) = create_test_repo();
         write_test_file(temp.path(), "test.txt", "initial");
 
@@ -935,8 +918,10 @@ mod tests {
             commit_message_template: "Auto: {timestamp}".to_owned(),
         };
 
-        let committed = check_and_commit(&repo_config).await.unwrap();
-        assert!(committed);
+        let committed = sync_repository(&repo_config, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(committed.committed);
 
         // Verify the commit was created
         let repo_after = GitRepository::open(temp.path()).unwrap();
@@ -946,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_and_commit_with_new_file() {
+    async fn test_sync_repository_with_new_file() {
         let (temp, repo) = create_test_repo();
         write_test_file(temp.path(), "initial.txt", "content");
 
@@ -964,8 +949,10 @@ mod tests {
             commit_message_template: "New file added".to_owned(),
         };
 
-        let committed = check_and_commit(&repo_config).await.unwrap();
-        assert!(committed);
+        let committed = sync_repository(&repo_config, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(committed.committed);
 
         // Verify the new file was committed
         let repo_after = GitRepository::open(temp.path()).unwrap();
@@ -975,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initialize_repository_clean() {
+    async fn test_sync_repository_clean() {
         let (temp, repo) = create_test_repo();
         write_test_file(temp.path(), "test.txt", "content");
 
@@ -991,12 +978,12 @@ mod tests {
         };
 
         // Should succeed without errors
-        let result = initialize_repository(&repo_config).await;
+        let result = sync_repository(&repo_config, Arc::new(AtomicBool::new(false))).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_initialize_repository_with_uncommitted_changes() {
+    async fn test_sync_repository_uses_configured_template() {
         let (temp, repo) = create_test_repo();
         write_test_file(temp.path(), "test.txt", "content");
 
@@ -1014,18 +1001,18 @@ mod tests {
             commit_message_template: "Auto: {timestamp}".to_owned(),
         };
 
-        let result = initialize_repository(&repo_config).await;
+        let result = sync_repository(&repo_config, Arc::new(AtomicBool::new(false))).await;
         assert!(result.is_ok());
 
         // Verify the change was committed
         let repo_after = GitRepository::open(temp.path()).unwrap();
         let head = repo_after.head().unwrap();
         let commit = repo_after.find_commit(head.target().unwrap()).unwrap();
-        assert_eq!(commit.message().unwrap(), "Auto-commit on daemon startup");
+        assert!(commit.message().unwrap().starts_with("Auto: "));
     }
 
     #[tokio::test]
-    async fn test_check_and_commit_respects_gitignore() {
+    async fn test_sync_repository_respects_gitignore() {
         let (temp, repo) = create_test_repo();
 
         // Create .gitignore
@@ -1046,8 +1033,10 @@ mod tests {
             commit_message_template: "Auto commit".to_owned(),
         };
 
-        let committed = check_and_commit(&repo_config).await.unwrap();
-        assert!(committed);
+        let committed = sync_repository(&repo_config, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(committed.committed);
 
         // Verify only tracked file was committed
         let repo_after = GitRepository::open(temp.path()).unwrap();
@@ -1057,5 +1046,282 @@ mod tests {
 
         assert!(tree.get_name("tracked.txt").is_some());
         assert!(tree.get_name("ignored.log").is_none());
+    }
+    fn repo_config(path: &Path) -> Repository {
+        Repository {
+            path: path.to_owned(),
+            auto_commit: true,
+            commit_message_template: "Automatic update".to_owned(),
+        }
+    }
+
+    fn git_command(path: &Path, args: &[&str]) -> Output {
+        Command::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap()
+    }
+
+    fn successful_git(path: &Path, args: &[&str]) {
+        let output = git_command(path, args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn conflicting_repo(operation: &str) -> (tempfile::TempDir, GitRepository) {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "initial\n");
+        stage_all_changes(&repo).unwrap();
+        create_test_commit(&repo, "Initial");
+        let original_branch = repo.head().unwrap().shorthand().unwrap().to_owned();
+        successful_git(temp.path(), &["checkout", "-b", "other"]);
+        write_test_file(temp.path(), "test.txt", "other\n");
+        stage_all_changes(&repo).unwrap();
+        create_test_commit(&repo, "Other change");
+        successful_git(temp.path(), &["checkout", &original_branch]);
+        write_test_file(temp.path(), "test.txt", "local\n");
+        stage_all_changes(&repo).unwrap();
+        create_test_commit(&repo, "Local change");
+        assert!(
+            !git_command(temp.path(), &[operation, "other"])
+                .status
+                .success()
+        );
+        let repo = GitRepository::open(temp.path()).unwrap();
+        assert!(repo.index().unwrap().has_conflicts());
+        (temp, repo)
+    }
+
+    #[test]
+    fn active_merge_and_rebase_remain_untouched() {
+        for operation in ["merge", "rebase"] {
+            let (temp, repo) = conflicting_repo(operation);
+            let state = repo.state();
+            let head = repo.head().unwrap().target();
+            let index = std::fs::read(repo.path().join("index")).unwrap();
+            let file = std::fs::read(temp.path().join("test.txt")).unwrap();
+            let result = sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false));
+            assert!(result.is_err());
+            assert_eq!(repo.state(), state);
+            assert_eq!(repo.head().unwrap().target(), head);
+            assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index);
+            assert_eq!(std::fs::read(temp.path().join("test.txt")).unwrap(), file);
+            assert!(repo.index().unwrap().has_conflicts());
+            assert!(pull_rebase(&repo, temp.path(), &AtomicBool::new(false)).is_err());
+            assert_eq!(repo.state(), state);
+        }
+    }
+
+    #[test]
+    fn conflicts_are_rejected_even_without_operation_marker() {
+        let (temp, repo) = conflicting_repo("merge");
+        std::fs::remove_file(repo.path().join("MERGE_HEAD")).unwrap();
+        assert_eq!(repo.state(), RepositoryState::Clean);
+        let index = std::fs::read(repo.path().join("index")).unwrap();
+        assert!(sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).is_err());
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index);
+    }
+
+    #[test]
+    fn commands_timeout_and_kill_descendants_holding_output_pipes() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let started = Instant::now();
+        let error =
+            run_command(command, &AtomicBool::new(false), Duration::from_millis(80)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn running_commands_are_cancelled_and_reaped() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = cancelled.clone();
+        let cancellation = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let started = Instant::now();
+        let error = run_command(command, &cancelled, Duration::from_secs(10)).unwrap_err();
+        cancellation.join().unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    fn remote_fixture() -> (tempfile::TempDir, tempfile::TempDir, GitRepository) {
+        let remote_dir = tempfile::tempdir().unwrap();
+        GitRepository::init_bare(remote_dir.path()).unwrap();
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "initial\n");
+        stage_all_changes(&repo).unwrap();
+        create_test_commit(&repo, "Initial");
+        repo.remote("origin", remote_dir.path().to_str().unwrap())
+            .unwrap();
+        successful_git(temp.path(), &["push", "-u", "origin", "HEAD"]);
+        (remote_dir, temp, repo)
+    }
+
+    #[test]
+    fn failed_push_is_retried_without_new_file_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (remote, temp, repo) = remote_fixture();
+        let hook = remote.path().join("hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_test_file(temp.path(), "test.txt", "changed\n");
+        let first =
+            sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).unwrap();
+        assert!(first.committed);
+        assert!(matches!(first.push, OperationOutcome::Failed(_)));
+        assert!(first.error_message().unwrap().contains("push:"));
+        std::fs::remove_file(hook).unwrap();
+        let second =
+            sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).unwrap();
+        assert!(!second.committed);
+        assert_eq!(second.push, OperationOutcome::Succeeded);
+        let remote_repo = GitRepository::open_bare(remote.path()).unwrap();
+        let branch = repo.head().unwrap().name().unwrap().to_owned();
+        assert_eq!(
+            remote_repo.find_reference(&branch).unwrap().target(),
+            repo.head().unwrap().target()
+        );
+    }
+
+    #[test]
+    fn diverged_changes_are_rebased_then_pushed_in_one_cycle() {
+        let (remote, temp, repo) = remote_fixture();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = GitRepository::clone(temp.path().to_str().unwrap(), other_dir.path()).unwrap();
+        let mut config = other.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        other
+            .remote_set_url("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_test_file(other_dir.path(), "remote.txt", "remote change\n");
+        stage_all_changes(&other).unwrap();
+        let remote_commit = create_test_commit(&other, "Remote change");
+        successful_git(other_dir.path(), &["push", "origin", "HEAD"]);
+        write_test_file(temp.path(), "test.txt", "local change\n");
+        let outcome =
+            sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).unwrap();
+        assert!(outcome.committed);
+        assert_eq!(outcome.pull, OperationOutcome::Succeeded);
+        assert_eq!(outcome.push, OperationOutcome::Succeeded);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_id(0).unwrap(), remote_commit);
+        let remote_repo = GitRepository::open_bare(remote.path()).unwrap();
+        let branch = repo.head().unwrap().name().unwrap().to_owned();
+        assert_eq!(
+            remote_repo.find_reference(&branch).unwrap().target(),
+            Some(head.id())
+        );
+    }
+
+    #[test]
+    fn failed_pull_is_an_explicit_failure() {
+        let (temp, repo) = create_test_repo();
+        repo.remote("origin", "/nonexistent/autogit-test-remote")
+            .unwrap();
+        write_test_file(temp.path(), "test.txt", "local change\n");
+        let outcome =
+            sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).unwrap();
+        assert!(outcome.committed);
+        assert!(matches!(outcome.pull, OperationOutcome::Failed(_)));
+        assert_eq!(outcome.push, OperationOutcome::Skipped);
+        assert!(outcome.error_message().unwrap().contains("pull:"));
+        assert_eq!(repo.state(), RepositoryState::Clean);
+    }
+    #[test]
+    fn failed_daemon_rebase_is_aborted_without_losing_local_commit() {
+        let (remote, temp, repo) = remote_fixture();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = GitRepository::clone(temp.path().to_str().unwrap(), other_dir.path()).unwrap();
+        other
+            .remote_set_url("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        write_test_file(other_dir.path(), "test.txt", "remote change\n");
+        stage_all_changes(&other).unwrap();
+        create_test_commit(&other, "Remote change");
+        successful_git(other_dir.path(), &["push", "origin", "HEAD"]);
+        write_test_file(temp.path(), "test.txt", "local change\n");
+        let outcome =
+            sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).unwrap();
+        assert!(outcome.committed);
+        assert!(matches!(outcome.pull, OperationOutcome::Failed(_)));
+        assert_eq!(outcome.push, OperationOutcome::Skipped);
+        assert_eq!(repo.state(), RepositoryState::Clean);
+        assert!(!repo.index().unwrap().has_conflicts());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("test.txt")).unwrap(),
+            "local change\n"
+        );
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(commit.message(), Some("Automatic update"));
+    }
+
+    #[test]
+    fn exited_command_does_not_leave_helpers_holding_output_readers() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & exit 0"]);
+        let started = Instant::now();
+        assert!(
+            run_command(command, &AtomicBool::new(false), Duration::from_secs(1))
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancellation_before_sync_preserves_working_tree_and_index() {
+        let (temp, repo) = create_test_repo();
+        write_test_file(temp.path(), "test.txt", "content");
+        assert!(sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(true)).is_err());
+        assert!(!has_staged_changes(&repo).unwrap());
+        assert!(repo.head().is_err());
+    }
+    #[test]
+    fn cancellation_during_push_preserves_committed_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+        let (remote, temp, repo) = remote_fixture();
+        let marker = remote.path().join("push-started");
+        let hook = remote.path().join("hooks/pre-receive");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_test_file(temp.path(), "test.txt", "changed\n");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = cancelled.clone();
+        let cancellation = thread::spawn(move || {
+            let started = Instant::now();
+            while !marker.exists() && started.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let outcome = sync_repository_sync(&repo_config(temp.path()), &cancelled).unwrap();
+        cancellation.join().unwrap();
+        assert!(outcome.committed);
+        assert!(matches!(outcome.push, OperationOutcome::Failed(_)));
+        assert!(outcome.error_message().unwrap().contains("cancelled"));
+        assert_eq!(repo.state(), RepositoryState::Clean);
+        assert!(!has_changes(&repo).unwrap());
     }
 }

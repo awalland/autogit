@@ -22,6 +22,7 @@ tracing-subscriber.workspace = true
 
 # Git operations
 git2.workspace = true
+libc = "0.2"
 
 # File watching
 notify.workspace = true
