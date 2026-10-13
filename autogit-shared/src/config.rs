@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{ErrorKind, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::{Builder, NamedTempFile};
 
@@ -69,6 +70,11 @@ fn default_commit_message() -> String {
     "Auto-commit: {timestamp}".to_owned()
 }
 
+struct ConfigPath {
+    target: PathBuf,
+    watch_paths: Vec<PathBuf>,
+}
+
 impl Config {
     /// Load configuration from a TOML file
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -86,9 +92,9 @@ impl Config {
     /// Save configuration to a TOML file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.validate()?;
-        let path = path.as_ref();
-        let _lock = Self::lock(path)?;
-        self.save_atomic(path)
+        let path = Self::resolved_path(path)?;
+        let _lock = Self::lock(&path)?;
+        self.save_atomic(&path)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -108,16 +114,16 @@ impl Config {
         path: impl AsRef<Path>,
         update: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let path = path.as_ref();
-        let _lock = Self::lock(path)?;
+        let path = Self::resolved_path(path)?;
+        let _lock = Self::lock(&path)?;
         let mut config = if path.exists() {
-            Self::load(path)?
+            Self::load(&path)?
         } else {
             Self::default()
         };
         let result = update(&mut config)?;
         config.validate()?;
-        config.save_atomic(path)?;
+        config.save_atomic(&path)?;
         Ok(result)
     }
 
@@ -141,19 +147,130 @@ impl Config {
         Ok(lock)
     }
 
-    /// Edit a private copy, then validate and atomically publish it under the transaction lock.
-    pub fn edit_file(path: impl AsRef<Path>, edit: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-        let path = path.as_ref();
-        let _lock = Self::lock(path)?;
-        let content = if path.exists() {
-            std::fs::read_to_string(path).context("Failed to read configuration for editing")?
+    /// Resolve the stable persistence target, preserving symlinks when replacing a config.
+    /// Missing target components are allowed so a dangling link can create its target.
+    pub fn resolved_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+        Ok(Self::resolve_path(path.as_ref())?.target)
+    }
+
+    /// Entries whose replacement can change the config contents or symlink target.
+    pub fn watch_paths(path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+        Ok(Self::resolve_path(path.as_ref())?.watch_paths)
+    }
+
+    fn resolve_path(path: &Path) -> Result<ConfigPath> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
         } else {
-            toml::to_string_pretty(&Self::default())?
+            std::env::current_dir()?.join(path)
         };
-        let temporary = Self::temporary_config(path, &content)?;
-        edit(temporary.path())?;
-        Self::load(temporary.path()).context("Edited configuration is invalid")?;
-        Self::persist_config(temporary, path)
+        let mut watch_paths = vec![absolute.clone()];
+        let mut remaining: VecDeque<_> = absolute
+            .components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect();
+        let mut resolved = PathBuf::new();
+        let mut links = 0;
+        while let Some(part) = remaining.pop_front() {
+            let component = Path::new(&part).components().next().unwrap();
+            match component {
+                Component::RootDir => resolved.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(_) => {
+                    let candidate = resolved.join(&part);
+                    match std::fs::symlink_metadata(&candidate) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            watch_paths.push(candidate.clone());
+                            links += 1;
+                            ensure!(links <= 40, "Too many configuration path symlinks");
+                            let target = std::fs::read_link(&candidate)?;
+                            if target.is_absolute() {
+                                resolved.clear();
+                            }
+                            for component in target.components().rev() {
+                                remaining.push_front(component.as_os_str().to_os_string());
+                            }
+                        }
+                        Ok(_) => resolved.push(part),
+                        Err(error) if error.kind() == ErrorKind::NotFound => resolved.push(part),
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("Failed to resolve config path: {}", candidate.display())
+                            });
+                        }
+                    }
+                }
+                Component::Prefix(_) => resolved.push(component.as_os_str()),
+            }
+        }
+        ensure!(
+            resolved.file_name().is_some(),
+            "Config path has no filename"
+        );
+        watch_paths.push(resolved.clone());
+        watch_paths.sort();
+        watch_paths.dedup();
+        Ok(ConfigPath {
+            target: resolved,
+            watch_paths,
+        })
+    }
+
+    /// Edit without holding the transaction lock, rejecting concurrent changes at publication.
+    pub fn edit_file(path: impl AsRef<Path>, edit: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+        let requested_path = path.as_ref();
+        let path = Self::resolved_path(requested_path)?;
+        std::fs::create_dir_all(config_parent(&path))?;
+        let original = Self::read_optional(&path)?;
+        let content = match &original {
+            Some(content) => content.clone(),
+            None => toml::to_string_pretty(&Self::default())?,
+        };
+        let temporary = Self::temporary_config(&path, &content)?;
+        let edited = edit(temporary.path())
+            .and_then(|()| Self::load(temporary.path()).context("Edited configuration is invalid"));
+        if let Err(error) = edited {
+            return Err(Self::retain_edit(temporary, error));
+        }
+        let publication = (|| {
+            let lock = Self::lock(&path)?;
+            ensure!(
+                Self::resolved_path(requested_path)? == path,
+                "Configuration target changed while the editor was open; edit was not applied"
+            );
+            ensure!(
+                Self::read_optional(&path)? == original,
+                "Configuration changed while the editor was open; edit was not applied"
+            );
+            Ok(lock)
+        })();
+        match publication {
+            Ok(_lock) => Self::persist_config(temporary, &path),
+            Err(error) => Err(Self::retain_edit(temporary, error)),
+        }
+    }
+
+    fn read_optional(path: &Path) -> Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("Failed to read configuration"),
+        }
+    }
+
+    fn retain_edit(temporary: NamedTempFile, error: anyhow::Error) -> anyhow::Error {
+        match temporary.keep() {
+            Ok((_, path)) => error.context(format!(
+                "Edited configuration retained at {}",
+                path.display()
+            )),
+            Err(retention) => error.context(format!(
+                "Failed to retain edited configuration: {retention}"
+            )),
+        }
     }
 
     fn save_atomic(&self, path: &Path) -> Result<()> {
@@ -181,12 +298,16 @@ impl Config {
 
     fn persist_config(temporary: NamedTempFile, path: &Path) -> Result<()> {
         // Editors may replace their file, so sync the current path rather than the original handle.
-        File::open(temporary.path())?
-            .sync_all()
-            .context("Failed to sync configuration")?;
-        temporary
-            .persist(path)
-            .context("Failed to replace configuration")?;
+        if let Err(error) = File::open(temporary.path())
+            .and_then(|file| file.sync_all())
+            .context("Failed to sync configuration")
+        {
+            return Err(Self::retain_edit(temporary, error));
+        }
+        temporary.persist(path).map_err(|error| {
+            Self::retain_edit(error.file, error.error.into())
+                .context("Failed to replace configuration")
+        })?;
         File::open(config_parent(path))?
             .sync_all()
             .context("Failed to sync config directory")?;
@@ -202,13 +323,16 @@ impl Config {
 
     /// Load a configuration, creating it once when absent under the same transaction lock.
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let _lock = Self::lock(path)?;
+        let path = Self::resolved_path(path)?;
         if path.exists() {
-            return Self::load(path);
+            return Self::load(&path);
+        }
+        let _lock = Self::lock(&path)?;
+        if path.exists() {
+            return Self::load(&path);
         }
         let config = Self::default();
-        config.save_atomic(path)?;
+        config.save_atomic(&path)?;
         Ok(config)
     }
 
@@ -545,6 +669,205 @@ mod tests {
             std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("# Keep this comment")
+        );
+    }
+    #[test]
+    fn atomic_writes_preserve_multihop_symlinks_and_create_missing_targets() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let alias = directory.path().join("config.toml");
+        let intermediate = directory.path().join("next.toml");
+        let target = directory.path().join("dotfiles/new/config.toml");
+        symlink("next.toml", &alias).unwrap();
+        symlink("dotfiles/new/config.toml", &intermediate).unwrap();
+        assert_eq!(Config::resolved_path(&alias).unwrap(), target);
+        let watched = Config::watch_paths(&alias).unwrap();
+        assert!(watched.contains(&alias));
+        assert!(watched.contains(&intermediate));
+        assert!(watched.contains(&target));
+        Config::load_or_create(&alias).unwrap();
+        Config::update(&alias, |config| {
+            config.daemon.check_interval_seconds = 42;
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&intermediate)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            Config::load(&target).unwrap().daemon.check_interval_seconds,
+            42
+        );
+        assert!(target.with_file_name("config.toml.lock").exists());
+        assert!(!alias.with_file_name("config.toml.lock").exists());
+    }
+
+    #[test]
+    fn parent_symlink_and_parent_traversal_resolve_to_target_identity() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual/nested");
+        std::fs::create_dir_all(&actual).unwrap();
+        let alias = directory.path().join("alias");
+        symlink("actual/nested", &alias).unwrap();
+        assert_eq!(
+            Config::resolved_path(alias.join("../config.toml")).unwrap(),
+            directory.path().join("actual/config.toml")
+        );
+        symlink("loop", directory.path().join("loop")).unwrap();
+        assert!(Config::resolved_path(directory.path().join("loop")).is_err());
+    }
+
+    #[test]
+    fn transactions_through_aliases_share_one_lock_and_preserve_updates() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        Config::default().save(&target).unwrap();
+        let alias = directory.path().join("alias.toml");
+        symlink("config.toml", &alias).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [target.clone(), alias]
+            .into_iter()
+            .map(|path| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for index in 0..20 {
+                        Config::update(&path, |config| {
+                            config.repositories.push(Repository {
+                                path: PathBuf::from(format!("/repository/{index}")),
+                                auto_commit: true,
+                                commit_message_template: default_commit_message(),
+                            });
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(Config::load(&target).unwrap().repositories.len(), 40);
+    }
+
+    #[test]
+    fn open_editor_allows_reads_and_updates_and_retains_conflicting_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let mut recovery = None;
+        let error = Config::edit_file(&path, |temporary| {
+            recovery = Some(temporary.to_path_buf());
+            assert_eq!(
+                Config::load_or_create(&path)?.daemon.check_interval_seconds,
+                300
+            );
+            Config::update(&path, |config| {
+                config.daemon.check_interval_seconds = 60;
+                Ok(())
+            })?;
+            std::fs::write(temporary, "[daemon]\ncheck_interval_seconds = 42\n")?;
+            Ok(())
+        })
+        .unwrap_err();
+        let recovery = recovery.unwrap();
+        let error = format!("{error:#}");
+        assert!(error.contains("Configuration changed while the editor was open"));
+        assert!(error.contains(recovery.to_str().unwrap()));
+        assert_eq!(
+            Config::load(&path).unwrap().daemon.check_interval_seconds,
+            60
+        );
+        assert_eq!(
+            Config::load(&recovery)
+                .unwrap()
+                .daemon
+                .check_interval_seconds,
+            42
+        );
+    }
+
+    #[test]
+    fn startup_reads_existing_config_without_waiting_for_transaction_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let _lock = Config::lock(&path).unwrap();
+        assert_eq!(
+            Config::load_or_create(&path)
+                .unwrap()
+                .daemon
+                .check_interval_seconds,
+            300
+        );
+    }
+
+    #[test]
+    fn editor_rejects_concurrent_creation_and_retains_invalid_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let error = Config::edit_file(&path, |temporary| {
+            Config::default().save(&path)?;
+            std::fs::write(temporary, "[daemon]\ncheck_interval_seconds = 42\n")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Configuration changed"));
+        let mut recovery = None;
+        let error = Config::edit_file(&path, |temporary| {
+            recovery = Some(temporary.to_path_buf());
+            std::fs::write(temporary, "invalid toml")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Edited configuration is invalid"));
+        assert_eq!(
+            std::fs::read_to_string(recovery.unwrap()).unwrap(),
+            "invalid toml"
+        );
+    }
+    #[test]
+    fn editor_rejects_retargeted_symlink() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.toml");
+        let other = directory.path().join("other.toml");
+        let alias = directory.path().join("config.toml");
+        Config::default().save(&original).unwrap();
+        Config::default().save(&other).unwrap();
+        symlink("original.toml", &alias).unwrap();
+        let error = Config::edit_file(&alias, |temporary| {
+            std::fs::write(temporary, "[daemon]\ncheck_interval_seconds = 42\n")?;
+            std::fs::remove_file(&alias)?;
+            symlink("other.toml", &alias)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("Configuration target changed"));
+        assert_eq!(
+            Config::load(&original)
+                .unwrap()
+                .daemon
+                .check_interval_seconds,
+            300
+        );
+        assert_eq!(
+            Config::load(&other).unwrap().daemon.check_interval_seconds,
+            300
         );
     }
 }
