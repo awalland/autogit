@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use std::time::Instant;
+use tokio::sync::{Notify, RwLock, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -15,6 +16,7 @@ pub struct SyncState {
     pub details: Vec<RepoDetail>,
     pub completed_cycles: u64,
     pub last_cycle: Option<CycleOutcome>,
+    pub last_successful_sync: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,13 +28,14 @@ pub enum CycleOutcome {
 
 struct Request {
     paths: Option<Vec<PathBuf>>,
-    reply: Option<oneshot::Sender<Response>>,
+    replies: Vec<oneshot::Sender<Response>>,
 }
 
 /// One worker owns all repository mutations, regardless of their trigger.
 #[derive(Clone)]
 pub struct Coordinator {
-    requests: mpsc::Sender<Request>,
+    pending: Arc<Mutex<Option<Request>>>,
+    wake: Arc<Notify>,
     pub state: watch::Receiver<SyncState>,
     pub suspended: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
@@ -66,39 +69,70 @@ impl Coordinator {
         suspended: Arc<AtomicBool>,
         runner: Arc<dyn RepositorySync>,
     ) -> (Self, JoinHandle<()>) {
-        let (requests, receiver) = mpsc::channel(16);
         let (state_tx, state) = watch::channel(SyncState::default());
         let coordinator = Self {
-            requests,
+            pending: Arc::new(Mutex::new(None)),
+            wake: Arc::new(Notify::new()),
             state,
             suspended,
             stopping: Arc::new(AtomicBool::new(false)),
             active_cancel: Arc::new(Mutex::new(None)),
         };
-        let worker = tokio::spawn(coordinator.clone().work(config, receiver, state_tx, runner));
+        let worker = tokio::spawn(coordinator.clone().work(config, state_tx, runner));
         (coordinator, worker)
     }
 
     pub fn schedule(&self, paths: Option<Vec<PathBuf>>) {
-        // Periodic requests are coalesced when the bounded queue is full.
-        let _ = self.requests.try_send(Request { paths, reply: None });
+        if self.suspended.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        self.enqueue(paths, None);
+    }
+
+    // A single pending cycle unions selected paths; a full cycle subsumes selections.
+    // Manual callers share its result, with a bounded number of waiting responses.
+    fn enqueue(&self, paths: Option<Vec<PathBuf>>, reply: Option<oneshot::Sender<Response>>) {
+        let mut pending = self.pending.lock().unwrap();
+        if self.stopping.load(Ordering::SeqCst) || self.suspended.load(Ordering::SeqCst) {
+            if let Some(reply) = reply {
+                let _ = reply.send(Response::error("Daemon is suspended or shutting down"));
+            }
+            return;
+        }
+        let request = pending.get_or_insert_with(|| Request {
+            paths: Some(Vec::new()),
+            replies: Vec::new(),
+        });
+        if let Some(reply) = reply {
+            if request.replies.len() >= 16 {
+                let _ = reply.send(Response::error("Too many pending sync requests"));
+                return;
+            }
+            request.replies.push(reply);
+        }
+        match (&mut request.paths, paths) {
+            (selection, None) => *selection = None,
+            (Some(selected), Some(paths)) => {
+                for path in paths {
+                    if !selected.contains(&path) {
+                        selected.push(path);
+                    }
+                }
+            }
+            (None, Some(_)) => {}
+        }
+        self.wake.notify_one();
     }
 
     pub async fn trigger(&self) -> Response {
         if self.suspended.load(Ordering::SeqCst) {
             return Response::error("Daemon is suspended");
         }
-        let (reply, result) = oneshot::channel();
-        if self
-            .requests
-            .try_send(Request {
-                paths: None,
-                reply: Some(reply),
-            })
-            .is_err()
-        {
-            return Response::error("Sync queue is full or daemon is shutting down");
+        if self.stopping.load(Ordering::SeqCst) {
+            return Response::error("Daemon is shutting down");
         }
+        let (reply, result) = oneshot::channel();
+        self.enqueue(None, Some(reply));
         result
             .await
             .unwrap_or_else(|_| Response::error("Daemon is shutting down"))
@@ -108,6 +142,11 @@ impl Coordinator {
         self.suspended.store(suspended, Ordering::SeqCst);
         if suspended {
             self.cancel_active();
+            if let Some(pending) = self.pending.lock().unwrap().take() {
+                for reply in pending.replies {
+                    let _ = reply.send(Response::error("Daemon is suspended"));
+                }
+            }
         }
         info!(suspended, "Updated daemon suspension");
     }
@@ -116,7 +155,7 @@ impl Coordinator {
         self.stopping.store(true, Ordering::SeqCst);
         self.cancel_active();
         // Wake an idle worker without depending on sender lifetimes.
-        self.schedule(None);
+        self.wake.notify_one();
     }
 
     fn cancel_active(&self) {
@@ -128,16 +167,19 @@ impl Coordinator {
     async fn work(
         self,
         config: Arc<RwLock<Config>>,
-        mut requests: mpsc::Receiver<Request>,
         state_tx: watch::Sender<SyncState>,
         runner: Arc<dyn RepositorySync>,
     ) {
-        while let Some(request) = requests.recv().await {
+        loop {
+            self.wake.notified().await;
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
+            let Some(request) = self.pending.lock().unwrap().take() else {
+                continue;
+            };
             if self.suspended.load(Ordering::SeqCst) {
-                if let Some(reply) = request.reply {
+                for reply in request.replies {
                     let _ = reply.send(Response::error("Daemon is suspended"));
                 }
                 continue;
@@ -149,27 +191,33 @@ impl Coordinator {
                 cancel.store(true, Ordering::SeqCst);
             }
             state_tx.send_modify(|state| state.syncing = true);
-            let repositories = config.read().await.repositories.clone();
+            let paths = config
+                .read()
+                .await
+                .repositories
+                .iter()
+                .map(|repo| repo.path.clone())
+                .collect::<Vec<_>>();
             let mut details = Vec::new();
-            for repo in repositories {
-                if !repo.auto_commit
-                    || request
-                        .paths
-                        .as_ref()
-                        .is_some_and(|paths| !paths.contains(&repo.path))
+            for path in paths {
+                if request
+                    .paths
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(&path))
                 {
                     continue;
                 }
-                // Recheck the active configuration between repositories, without holding a lock over Git.
-                if !config
+                // Resolve all settings immediately before starting this repository.
+                let repo = config
                     .read()
                     .await
                     .repositories
                     .iter()
-                    .any(|active| active.path == repo.path && active.auto_commit)
-                {
+                    .find(|active| active.path == path && active.auto_commit)
+                    .cloned();
+                let Some(repo) = repo else {
                     continue;
-                }
+                };
                 if cancel.load(Ordering::SeqCst) || self.suspended.load(Ordering::SeqCst) {
                     break;
                 }
@@ -236,6 +284,9 @@ impl Coordinator {
                     }
                 }
                 state.completed_cycles += 1;
+                if !failed {
+                    state.last_successful_sync = Some(Instant::now());
+                }
                 state.last_cycle = Some(if interrupted {
                     CycleOutcome::Interrupted
                 } else if failed {
@@ -255,10 +306,12 @@ impl Coordinator {
                 )
                 .await;
             }
-            if let Some(reply) = request.reply {
-                let _ = reply.send(response);
+            for reply in request.replies {
+                let _ = reply.send(response.clone());
             }
         }
+        // Release pending callers even while external coordinator handles remain alive.
+        self.pending.lock().unwrap().take();
     }
 }
 
@@ -269,10 +322,10 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Semaphore, mpsc};
 
     struct ControlledSync {
-        entered: mpsc::UnboundedSender<PathBuf>,
+        entered: mpsc::UnboundedSender<Repository>,
         permits: Arc<Semaphore>,
         fail_push: bool,
     }
@@ -283,7 +336,7 @@ mod tests {
             let permits = self.permits.clone();
             let fail = self.fail_push;
             Box::pin(async move {
-                entered.send(repository.path).unwrap();
+                entered.send(repository).unwrap();
                 loop {
                     tokio::select! {
                         permit = permits.acquire() => { permit.unwrap().forget(); break; }
@@ -318,7 +371,7 @@ mod tests {
         coordinator: Coordinator,
         worker: JoinHandle<()>,
         config: Arc<RwLock<Config>>,
-        entered: mpsc::UnboundedReceiver<PathBuf>,
+        entered: mpsc::UnboundedReceiver<Repository>,
         permits: Arc<Semaphore>,
     }
 
@@ -388,7 +441,7 @@ mod tests {
             let coordinator = coordinator.clone();
             async move { coordinator.trigger().await }
         });
-        assert_eq!(entered.recv().await.unwrap(), PathBuf::from("/repo0"));
+        assert_eq!(entered.recv().await.unwrap().path, PathBuf::from("/repo0"));
         let second = tokio::spawn({
             let coordinator = coordinator.clone();
             async move { coordinator.trigger().await }
@@ -486,6 +539,112 @@ mod tests {
         assert!(entered.try_recv().is_err());
         coordinator.shutdown();
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_repository_uses_current_settings_even_if_initially_disabled() {
+        let TestHarness {
+            coordinator,
+            worker,
+            config,
+            mut entered,
+            permits,
+        } = setup(2, false);
+        config.write().await.repositories[1].auto_commit = false;
+        coordinator.schedule(None);
+        assert_eq!(entered.recv().await.unwrap().path, PathBuf::from("/repo0"));
+        {
+            let mut current = config.write().await;
+            current.repositories[1].auto_commit = true;
+            current.repositories[1].commit_message_template = "new template".to_owned();
+        }
+        permits.add_permits(1);
+        let next = entered.recv().await.unwrap();
+        assert_eq!(next.path, PathBuf::from("/repo1"));
+        assert_eq!(next.commit_message_template, "new template");
+        coordinator.shutdown();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_bursts_merge_paths_into_one_pending_cycle() {
+        let TestHarness {
+            coordinator,
+            worker,
+            mut entered,
+            permits,
+            ..
+        } = setup(3, false);
+        coordinator.schedule(Some(vec![PathBuf::from("/repo0")]));
+        entered.recv().await.unwrap();
+        for _ in 0..50 {
+            coordinator.schedule(Some(vec![PathBuf::from("/repo1")]));
+            coordinator.schedule(Some(vec![PathBuf::from("/repo2")]));
+        }
+        permits.add_permits(1);
+        assert_eq!(entered.recv().await.unwrap().path, PathBuf::from("/repo1"));
+        permits.add_permits(1);
+        assert_eq!(entered.recv().await.unwrap().path, PathBuf::from("/repo2"));
+        permits.add_permits(1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), entered.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(coordinator.state.borrow().completed_cycles, 2);
+        coordinator.shutdown();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_cycles_coalesce_and_manual_waiters_are_bounded() {
+        let TestHarness {
+            coordinator,
+            worker,
+            config,
+            mut entered,
+            permits,
+        } = setup(1, false);
+        coordinator.schedule(None);
+        entered.recv().await.unwrap();
+        for _ in 0..50 {
+            coordinator.schedule(None);
+        }
+        let mut results = Vec::new();
+        for _ in 0..16 {
+            let (reply, result) = oneshot::channel();
+            coordinator.enqueue(None, Some(reply));
+            results.push(result);
+        }
+        let rejected = coordinator.trigger().await;
+        assert_eq!(rejected.status, ResponseStatus::Error);
+        assert_eq!(
+            command(config, coordinator.clone(), autogit_shared::Command::Ping)
+                .await
+                .status,
+            ResponseStatus::Ok
+        );
+        permits.add_permits(1);
+        entered.recv().await.unwrap();
+        permits.add_permits(1);
+        for result in results {
+            assert_eq!(result.await.unwrap().status, ResponseStatus::Ok);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), entered.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(coordinator.state.borrow().completed_cycles, 2);
+        let completed = coordinator.state.borrow().last_successful_sync.unwrap();
+        coordinator.schedule(None);
+        entered.recv().await.unwrap();
+        coordinator.shutdown();
+        worker.await.unwrap();
+        assert_eq!(
+            coordinator.state.borrow().last_successful_sync,
+            Some(completed)
+        );
     }
 
     #[tokio::test]
