@@ -46,8 +46,10 @@ else
 fi
 
 # Include dependencies so the source RPM can build without network access.
-cargo vendor --locked --manifest-path "$package_dir/Cargo.toml" \
-    "$package_dir/vendor" > "$package_dir/.cargo/config.toml"
+(
+    cd "$package_dir"
+    cargo vendor --locked vendor > .cargo/config.toml
+)
 tar -czf "$rpmbuild_dir/SOURCES/autogit-$version.tar.gz" \
     -C "$temporary_dir" "autogit-$version"
 sed "s|^Version:.*|Version:        $version|" "$project_dir/autogit.spec" \
