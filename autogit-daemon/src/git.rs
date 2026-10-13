@@ -80,7 +80,21 @@ fn ensure_available(repo: &GitRepository, cancelled: &AtomicBool) -> Result<()> 
 // A separate process group lets shutdown terminate Git's SSH/credential-helper children too.
 fn terminate_process(child: &mut Child) -> Result<()> {
     let process_group = i32::try_from(child.id()).context("Git process ID is out of range")?;
+    // Give Git's signal handlers time to remove locks before forcibly terminating
+    // any remaining helpers. Never remove lock files whose ownership is unknown.
     // SAFETY: the child was placed in its own process group before spawning.
+    unsafe { libc::kill(-process_group, libc::SIGTERM) };
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(250) {
+        let leader_exited = child.try_wait()?.is_some();
+        // SAFETY: signal zero only tests whether this command's group still exists.
+        let group_exists = unsafe { libc::kill(-process_group, 0) } == 0;
+        if leader_exited && !group_exists {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: any remaining members belong to the command's process group.
     unsafe { libc::kill(-process_group, libc::SIGKILL) };
     let _ = child.kill();
     child.wait().context("Failed to reap Git process")?;
@@ -1323,5 +1337,46 @@ mod tests {
         assert!(outcome.error_message().unwrap().contains("cancelled"));
         assert_eq!(repo.state(), RepositoryState::Clean);
         assert!(!has_changes(&repo).unwrap());
+    }
+    #[test]
+    fn cancelled_command_can_clean_up_before_forced_termination() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("cleaned-up");
+        let ready = directory.path().join("ready");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "trap 'touch \"$1\"; exit 0' TERM; touch \"$2\"; sleep 30 & wait",
+                "sh",
+            ])
+            .arg(&marker)
+            .arg(&ready);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = cancelled.clone();
+        let cancellation = thread::spawn(move || {
+            let started = Instant::now();
+            while !ready.exists() && started.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let error = run_command(command, &cancelled, Duration::from_secs(5)).unwrap_err();
+        cancellation.join().unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(marker.exists());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn termination_grace_is_bounded_when_command_ignores_sigterm() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; sleep 30 & wait"]);
+        let started = Instant::now();
+        let error =
+            run_command(command, &AtomicBool::new(false), Duration::from_millis(80)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
