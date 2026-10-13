@@ -81,13 +81,18 @@ impl AutogitTray {
         let mut state = self.status.write().unwrap();
         state.last_sync = Some(Instant::now());
         state.status = TrayStatus::Idle;
+        state.error_count = 0;
     }
 
-    /// Increment error count
-    pub fn increment_errors(&self) {
+    /// Reflect current repository errors rather than accumulating past failures.
+    pub fn set_error_count(&self, count: usize) {
         let mut state = self.status.write().unwrap();
-        state.error_count += 1;
-        state.status = TrayStatus::Error;
+        state.error_count = count;
+        state.status = if count > 0 {
+            TrayStatus::Error
+        } else {
+            TrayStatus::Idle
+        };
     }
 
     /// Update repository count
@@ -479,27 +484,33 @@ mod tests {
         let (tray, _rx) = create_test_tray();
 
         assert!(tray.get_state().last_sync.is_none());
+        tray.set_error_count(1);
 
         tray.set_last_sync();
 
         let state = tray.get_state();
         assert!(state.last_sync.is_some());
         assert_eq!(state.status, TrayStatus::Idle);
+        assert_eq!(state.error_count, 0);
+        assert!(tray.attention_icon_pixmap().is_empty());
     }
 
     #[test]
-    fn test_increment_errors() {
+    fn test_set_error_count() {
         let (tray, _rx) = create_test_tray();
 
         assert_eq!(tray.get_state().error_count, 0);
 
-        tray.increment_errors();
+        tray.set_error_count(1);
         assert_eq!(tray.get_state().error_count, 1);
         assert_eq!(tray.get_state().status, TrayStatus::Error);
 
-        tray.increment_errors();
+        tray.set_error_count(2);
         assert_eq!(tray.get_state().error_count, 2);
         assert_eq!(tray.get_state().status, TrayStatus::Error);
+        tray.set_error_count(0);
+        assert_eq!(tray.get_state().status, TrayStatus::Idle);
+        assert!(tray.attention_icon_pixmap().is_empty());
     }
 
     #[test]
@@ -549,11 +560,11 @@ mod tests {
     #[test]
     fn test_tray_title_error() {
         let (tray, _rx) = create_test_tray();
-        tray.increment_errors();
+        tray.set_error_count(1);
 
         assert_eq!(tray.title(), "Autogit - 1 errors");
 
-        tray.increment_errors();
+        tray.set_error_count(2);
         assert_eq!(tray.title(), "Autogit - 2 errors");
     }
 
@@ -576,7 +587,7 @@ mod tests {
         tray.set_status(TrayStatus::Syncing);
         assert_eq!(tray.icon_name(), "");
 
-        tray.increment_errors();
+        tray.set_error_count(1);
         assert_eq!(tray.icon_name(), "");
     }
 
@@ -599,7 +610,7 @@ mod tests {
         assert!(icons[0].width > 0);
 
         // Test error icon
-        tray.increment_errors();
+        tray.set_error_count(1);
         let icons = tray.icon_pixmap();
         assert_eq!(icons.len(), 1);
         assert!(icons[0].width > 0);
@@ -614,7 +625,7 @@ mod tests {
         assert_eq!(icons.len(), 0);
 
         // With errors - should return error icon
-        tray.increment_errors();
+        tray.set_error_count(1);
         let icons = tray.attention_icon_pixmap();
         assert_eq!(icons.len(), 1);
         assert!(icons[0].width > 0);

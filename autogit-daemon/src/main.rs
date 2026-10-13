@@ -4,8 +4,8 @@ mod socket;
 mod tray;
 
 use anyhow::{Context, Result};
-use autogit_shared::Config;
-use coordinator::Coordinator;
+use autogit_shared::{Config, RepoDetail};
+use coordinator::{Coordinator, CycleOutcome};
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::Arc;
@@ -55,7 +55,6 @@ async fn main() -> Result<()> {
     coordinator.schedule(None);
     loop {
         tokio::select! {
-            biased;
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             Some(action) = actions_rx.recv() => match action {
@@ -196,22 +195,22 @@ async fn manage_tray(
                 .collect::<Vec<_>>();
             let completed = state.completed_cycles != cycles;
             cycles = state.completed_cycles;
+            let error_count = active_error_count(&config, &details);
             let _ = tokio::time::timeout(
                 Duration::from_secs(2),
                 tray.update(|tray| {
                     tray.update_repo_details(details.clone());
                     tray.set_repo_count(config.repositories.len());
                     tray.set_check_interval(config.daemon.check_interval_seconds);
+                    tray.set_error_count(error_count);
                     if state.syncing {
                         tray.set_status(tray::TrayStatus::Syncing);
-                    } else if details.iter().any(|detail| detail.error.is_some()) {
-                        if completed {
-                            tray.increment_errors();
-                        } else {
-                            tray.set_status(tray::TrayStatus::Error);
-                        }
-                    } else if completed {
+                    } else if error_count > 0 {
+                        tray.set_status(tray::TrayStatus::Error);
+                    } else if completed && state.last_cycle == Some(CycleOutcome::Succeeded) {
                         tray.set_last_sync();
+                    } else {
+                        tray.set_status(tray::TrayStatus::Idle);
                     }
                 }),
             )
@@ -223,10 +222,47 @@ async fn manage_tray(
     }
 }
 
+fn active_error_count(config: &Config, details: &[RepoDetail]) -> usize {
+    details
+        .iter()
+        .filter(|detail| {
+            detail.error.is_some()
+                && config
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.auto_commit && repository.path == detail.path)
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autogit_shared::Repository;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn disabled_repositories_do_not_keep_the_tray_in_error() {
+        let path = PathBuf::from("/test/repository");
+        let mut config = Config::default();
+        config.repositories.push(Repository {
+            path: path.clone(),
+            auto_commit: true,
+            commit_message_template: "Test commit".to_owned(),
+        });
+        let details = vec![RepoDetail {
+            path,
+            committed: false,
+            files_changed: None,
+            error: Some("Failed to pull".to_owned()),
+        }];
+        assert_eq!(active_error_count(&config, &details), 1);
+        config.repositories[0].auto_commit = false;
+        assert_eq!(active_error_count(&config, &details), 0);
+        config.repositories.clear();
+        assert_eq!(active_error_count(&config, &details), 0);
+    }
 
     #[tokio::test]
     async fn tray_service_shutdown_closes_handle_before_replacement() {

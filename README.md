@@ -8,7 +8,7 @@ Automatic git commit daemon with a simple CLI configuration tool and system tray
 
 `autogit` consists of two components:
 
-- **autogit-daemon**: A background daemon that watches configured git repositories and automatically commits changes at regular intervals
+- **autogit-daemon**: A background daemon that checks configured Git repositories at regular intervals, commits changes, pulls with rebase, and pushes unpublished commits
 - **autogit**: A CLI tool for configuring the daemon
 
 ## Usage
@@ -22,7 +22,7 @@ autogit add ~/projects/notes
 # Add with custom commit message
 autogit add ~/documents/journal -m "Journal update: {timestamp}"
 
-# Add and set check interval to 60 seconds
+# Add and set the global check interval to 60 seconds
 autogit add ~/code/drafts -i 60
 ```
 
@@ -65,9 +65,24 @@ autogit status
 autogit edit
 ```
 
+Use `autogit now` for an immediate synchronisation cycle. `autogit suspend`
+interrupts active work and prevents scheduled, CLI, and tray syncs until
+`autogit resume`. Status reports the daemon's applied configuration and latest
+repository results. Failed synchronisation makes `autogit now` exit unsuccessfully.
+
+All sync requests run through one coordinator. Repositories with active Git
+operations or unresolved conflicts are left untouched. Remote changes are pulled
+with rebase before pushing, and subsequent cycles retry unpublished commits even
+when there are no new file changes. Git subprocesses have a 60-second deadline.
+
 ## Configuration
 
 Configuration is stored at `~/.config/autogit/config.toml`.
+
+The interval must be at least 1 second and fit the platform's timer range.
+CLI updates are locked and written atomically. `autogit edit` validates an edited
+private copy before publishing it; invalid edits leave the current file intact.
+The daemon keeps its applied configuration if a direct file edit is invalid.
 
 Example configuration:
 
@@ -125,6 +140,15 @@ cargo build --release
 The binaries will be available at:
 - `target/release/autogit-daemon`
 - `target/release/autogit`
+
+### Building RPM packages
+
+`./build-rpm.sh` builds source and binary RPMs using `autogit.spec`, including the
+test suite. Install the packages listed in the specification's `BuildRequires`
+first. `./build-rpm.sh --source-only` creates just the source RPM. The script
+vendors dependencies so the packaged sources can build without network access.
+Artifacts go to `~/rpmbuild` by default; `AUTOGIT_RPMBUILD_DIR` selects another
+output directory.
 
 ## Manuall Installation
 
@@ -191,13 +215,17 @@ journalctl --user-unit=autogit-daemon -f
 
 ## Requirements
 
-- Rust 1.85 or later
+- Rust 1.89 or later
 - Git (with `user.name` and `user.email` configured)
 - Linux (for systemd integration)
 
 ## Development
 
 ### Running Tests
+
+Tray lifecycle tests require `dbus-run-session` (provided by `dbus-1-daemon` on
+openSUSE). Tests isolate configuration paths and child environments without
+mutating the test process environment.
 
 ```bash
 cargo test

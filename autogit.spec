@@ -14,6 +14,7 @@ BuildRequires:  libopenssl-devel
 BuildRequires:  libssh2-devel
 BuildRequires:  zlib-devel
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  dbus-1-daemon
 Requires:       git
 
 %description

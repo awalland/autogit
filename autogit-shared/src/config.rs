@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tempfile::{Builder, NamedTempFile};
 
 /// Main configuration structure
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -160,8 +161,8 @@ impl Config {
         Self::persist_config(Self::temporary_config(path, &content)?, path)
     }
 
-    fn temporary_config(path: &Path, content: &str) -> Result<tempfile::NamedTempFile> {
-        let mut temporary = tempfile::Builder::new()
+    fn temporary_config(path: &Path, content: &str) -> Result<NamedTempFile> {
+        let mut temporary = Builder::new()
             .prefix(".config-")
             .suffix(".toml")
             .tempfile_in(config_parent(path))
@@ -178,7 +179,7 @@ impl Config {
         Ok(temporary)
     }
 
-    fn persist_config(temporary: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    fn persist_config(temporary: NamedTempFile, path: &Path) -> Result<()> {
         // Editors may replace their file, so sync the current path rather than the original handle.
         File::open(temporary.path())?
             .sync_all()
