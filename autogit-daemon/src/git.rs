@@ -4,7 +4,8 @@ use chrono::Local;
 use git2::{
     IndexAddOption, Repository as GitRepository, RepositoryState, Signature, Status, StatusOptions,
 };
-use std::io::Read;
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -101,11 +102,35 @@ fn terminate_process(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-fn read_command_output(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut captured = Vec::new();
-    stream.by_ref().take(64 * 1024).read_to_end(&mut captured)?;
-    std::io::copy(&mut stream, &mut std::io::sink())?;
-    Ok(captured)
+const OUTPUT_CAPTURE_LIMIT: usize = 64 * 1024;
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+fn make_nonblocking(stream: &impl AsRawFd) -> std::io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: the stream owns a valid descriptor for the duration of both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_output(stream: &mut impl Read, captured: &mut Vec<u8>) -> std::io::Result<bool> {
+    let mut buffer = [0; 8192];
+    // Limit each pass so continuous output cannot starve cancellation or deadlines.
+    for _ in 0..64 {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                let remaining = OUTPUT_CAPTURE_LIMIT - captured.len();
+                captured.extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn run_command(mut command: Command, cancelled: &AtomicBool, timeout: Duration) -> Result<Output> {
@@ -118,48 +143,56 @@ fn run_command(mut command: Command, cancelled: &AtomicBool, timeout: Duration) 
         .stderr(Stdio::piped())
         .process_group(0);
     let mut child = command.spawn().context("Failed to start Git command")?;
-    let stdout = child.stdout.take().context("Missing Git stdout")?;
-    let stderr = child.stderr.take().context("Missing Git stderr")?;
-    let stdout_reader = thread::spawn(move || read_command_output(stdout));
-    let stderr_reader = thread::spawn(move || read_command_output(stderr));
-    let started = Instant::now();
-    let status = loop {
-        if cancelled.load(Ordering::Relaxed) {
-            terminate_process(&mut child)?;
-            break Err(anyhow::anyhow!("Git operation cancelled"));
-        }
-        if started.elapsed() >= timeout {
-            terminate_process(&mut child)?;
-            break Err(anyhow::anyhow!(
-                "Git operation timed out after {} seconds",
-                timeout.as_secs()
-            ));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                terminate_process(&mut child)?;
-                break Err(error.into());
+    let result = (|| {
+        let mut stdout = child.stdout.take().context("Missing Git stdout")?;
+        let mut stderr = child.stderr.take().context("Missing Git stderr")?;
+        make_nonblocking(&stdout)?;
+        make_nonblocking(&stderr)?;
+        let mut captured_stdout = Vec::new();
+        let mut captured_stderr = Vec::new();
+        let mut status = None;
+        let mut exited_at = None;
+        let started = Instant::now();
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("Git operation cancelled");
             }
+            if started.elapsed() >= timeout {
+                bail!(
+                    "Git operation timed out after {} seconds",
+                    timeout.as_secs()
+                );
+            }
+            let stdout_closed = drain_output(&mut stdout, &mut captured_stdout)?;
+            let stderr_closed = drain_output(&mut stderr, &mut captured_stderr)?;
+            if status.is_none() {
+                status = child.try_wait()?;
+                if status.is_some() {
+                    exited_at = Some(Instant::now());
+                    let process_group =
+                        i32::try_from(child.id()).context("Git process ID is out of range")?;
+                    // SAFETY: this group was created for the command. Helpers that
+                    // escape it cannot be killed reliably; their pipes are closed below.
+                    unsafe { libc::kill(-process_group, libc::SIGKILL) };
+                }
+            }
+            if let Some(status) = status
+                && ((stdout_closed && stderr_closed)
+                    || exited_at.is_some_and(|time| time.elapsed() >= OUTPUT_DRAIN_GRACE))
+            {
+                return Ok(Output {
+                    status,
+                    stdout: captured_stdout,
+                    stderr: captured_stderr,
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-    };
-    // A command may exit while a helper still holds its output pipes open.
-    // Terminate remaining group members before joining the readers.
-    let process_group = i32::try_from(child.id()).context("Git process ID is out of range")?;
-    // SAFETY: this group was created specifically for the spawned command.
-    unsafe { libc::kill(-process_group, libc::SIGKILL) };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("Git stdout reader panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("Git stderr reader panicked"))??;
-    Ok(Output {
-        status: status?,
-        stdout,
-        stderr,
-    })
+    })();
+    if result.is_err() {
+        terminate_process(&mut child)?;
+    }
+    result
 }
 
 fn run_git(repo_path: &Path, arguments: &[&str], cancelled: &AtomicBool) -> OperationOutcome {
@@ -219,31 +252,10 @@ fn pull_rebase(
     if !has_origin(repo)? {
         return Ok(OperationOutcome::Skipped);
     }
-    let mut outcome = run_git(repo_path, &["pull", "--rebase"], cancelled);
-    if let OperationOutcome::Failed(message) = &mut outcome {
-        let repo_after = open_repository(repo_path)?;
-        // The precondition excluded any existing operation. Only abort a rebase
-        // left by this pull, never an unrelated merge/cherry-pick or a user's rebase.
-        if matches!(
-            repo_after.state(),
-            RepositoryState::Rebase
-                | RepositoryState::RebaseInteractive
-                | RepositoryState::RebaseMerge
-        ) {
-            // Cleanup remains bounded even when shutdown cancelled the original command.
-            let mut cleanup = Command::new("git");
-            cleanup.args(["rebase", "--abort"]).current_dir(repo_path);
-            match run_command(cleanup, &AtomicBool::new(false), Duration::from_secs(5)) {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => message.push_str(&format!(
-                    "; rebase cleanup failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Err(error) => message.push_str(&format!("; rebase cleanup failed: {error:#}")),
-            }
-        }
-    }
-    Ok(outcome)
+    // Another Git client can begin an operation after the precondition check.
+    // Git exposes no ownership token for a rebase, so leave failed operations for
+    // manual resolution rather than risking aborting the user's work.
+    Ok(run_git(repo_path, &["pull", "--rebase"], cancelled))
 }
 
 pub async fn sync_repository(
@@ -1259,8 +1271,8 @@ mod tests {
         assert_eq!(repo.state(), RepositoryState::Clean);
     }
     #[test]
-    fn failed_daemon_rebase_is_aborted_without_losing_local_commit() {
-        let (remote, temp, repo) = remote_fixture();
+    fn failed_daemon_rebase_is_preserved_for_manual_resolution() {
+        let (remote, temp, _repo) = remote_fixture();
         let other_dir = tempfile::tempdir().unwrap();
         let other = GitRepository::clone(temp.path().to_str().unwrap(), other_dir.path()).unwrap();
         other
@@ -1276,18 +1288,190 @@ mod tests {
         assert!(outcome.committed);
         assert!(matches!(outcome.pull, OperationOutcome::Failed(_)));
         assert_eq!(outcome.push, OperationOutcome::Skipped);
-        assert_eq!(repo.state(), RepositoryState::Clean);
-        assert!(!repo.index().unwrap().has_conflicts());
-        assert_eq!(
-            std::fs::read_to_string(temp.path().join("test.txt")).unwrap(),
-            "local change\n"
-        );
-        let commit = repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(commit.message(), Some("Automatic update"));
+        let repo = GitRepository::open(temp.path()).unwrap();
+        assert_ne!(repo.state(), RepositoryState::Clean);
+        assert!(repo.index().unwrap().has_conflicts());
+        let content = std::fs::read_to_string(temp.path().join("test.txt")).unwrap();
+        assert!(content.contains("<<<<<<<"));
+        assert!(content.contains("local change"));
+        assert!(content.contains("remote change"));
+        let original = repo
+            .find_reference("ORIG_HEAD")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        assert_eq!(original.message(), Some("Automatic update"));
+        let state = repo.state();
+        let index = std::fs::read(repo.path().join("index")).unwrap();
+        assert!(sync_repository_sync(&repo_config(temp.path()), &AtomicBool::new(false)).is_err());
+        assert_eq!(repo.state(), state);
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index);
     }
 
     #[test]
-    fn exited_command_does_not_leave_helpers_holding_output_readers() {
+    fn failed_pull_does_not_abort_rebase_started_by_another_client() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, repo) = conflicting_repo("rebase");
+        successful_git(temp.path(), &["rebase", "--abort"]);
+        let remote = tempfile::tempdir().unwrap();
+        GitRepository::init_bare(remote.path()).unwrap();
+        repo.remote("origin", remote.path().to_str().unwrap())
+            .unwrap();
+        let ready = remote.path().join("ready");
+        let release = remote.path().join("release");
+        let helper = remote.path().join("upload-pack");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nexit 1\n",
+                ready.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("remote.origin.uploadpack", helper.to_str().unwrap())
+            .unwrap();
+        let path = temp.path().to_owned();
+        let pull = thread::spawn(move || {
+            let repo = GitRepository::open(&path).unwrap();
+            pull_rebase(&repo, &path, &AtomicBool::new(false)).unwrap()
+        });
+        let started = Instant::now();
+        while !ready.exists() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            std::fs::write(&release, "").unwrap();
+            pull.join().unwrap();
+            panic!("Pull did not reach the upload-pack gate");
+        }
+        assert!(
+            !git_command(temp.path(), &["rebase", "other"])
+                .status
+                .success()
+        );
+        let state = repo.state();
+        let head = repo.head().unwrap().target();
+        let index = std::fs::read(repo.path().join("index")).unwrap();
+        let content = std::fs::read(temp.path().join("test.txt")).unwrap();
+        std::fs::write(&release, "").unwrap();
+        assert!(matches!(pull.join().unwrap(), OperationOutcome::Failed(_)));
+        assert_ne!(state, RepositoryState::Clean);
+        assert_eq!(repo.state(), state);
+        assert_eq!(repo.head().unwrap().target(), head);
+        assert_eq!(std::fs::read(repo.path().join("index")).unwrap(), index);
+        assert_eq!(
+            std::fs::read(temp.path().join("test.txt")).unwrap(),
+            content
+        );
+    }
+
+    struct EscapedHelper {
+        directory: tempfile::TempDir,
+    }
+
+    impl EscapedHelper {
+        fn command(&self, exit_parent: bool) -> Command {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                if exit_parent {
+                    "setsid sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & while [ ! -s \"$1\" ]; do sleep 0.01; done; exit 0"
+                } else {
+                    "setsid sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" & wait"
+                },
+                "sh",
+            ]).arg(self.directory.path().join("pid"));
+            command
+        }
+    }
+
+    impl Drop for EscapedHelper {
+        fn drop(&mut self) {
+            if let Ok(pid) = std::fs::read_to_string(self.directory.path().join("pid")) {
+                let pid: i32 = pid.trim().parse().unwrap();
+                // SAFETY: the test helper records its own process ID before exec.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    #[test]
+    fn exited_command_closes_pipes_held_by_escaped_helper() {
+        let helper = EscapedHelper {
+            directory: tempfile::tempdir().unwrap(),
+        };
+        let started = Instant::now();
+        let output = run_command(
+            helper.command(true),
+            &AtomicBool::new(false),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(helper.directory.path().join("pid").exists());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timeout_closes_pipes_held_by_escaped_helper() {
+        let helper = EscapedHelper {
+            directory: tempfile::tempdir().unwrap(),
+        };
+        let started = Instant::now();
+        let error = run_command(
+            helper.command(false),
+            &AtomicBool::new(false),
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(helper.directory.path().join("pid").exists());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancellation_closes_pipes_held_by_escaped_helper() {
+        let helper = EscapedHelper {
+            directory: tempfile::tempdir().unwrap(),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = cancelled.clone();
+        let marker = helper.directory.path().join("pid");
+        let cancellation = thread::spawn(move || {
+            let started = Instant::now();
+            while !marker.exists() && started.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let error =
+            run_command(helper.command(false), &cancelled, Duration::from_secs(5)).unwrap_err();
+        cancellation.join().unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(helper.directory.path().join("pid").exists());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn output_capture_is_capped_while_excess_bytes_are_drained() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2",
+        ]);
+        let output = run_command(command, &AtomicBool::new(false), Duration::from_secs(5)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), OUTPUT_CAPTURE_LIMIT);
+        assert_eq!(output.stderr.len(), OUTPUT_CAPTURE_LIMIT);
+    }
+
+    #[test]
+    fn exited_command_terminates_group_helpers() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 30 & exit 0"]);
         let started = Instant::now();
