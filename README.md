@@ -151,9 +151,11 @@ The binaries will be available at:
 ### Building RPM packages
 
 `./build-rpm.sh` builds source and binary RPMs using `autogit.spec`, including the
-test suite. Install the packages listed in the specification's `BuildRequires`
-first. `./build-rpm.sh --source-only` creates just the source RPM. The script
-vendors dependencies so the packaged sources can build without network access.
+test suite. Cargo and Rust must be available on `PATH`; they can come from rustup
+or distribution packages. Install the remaining packages listed in the
+specification's `BuildRequires` first. `./build-rpm.sh --source-only` creates just
+the source RPM. The script vendors dependencies so the packaged sources can
+build without network access.
 Artifacts go to `~/rpmbuild` by default; `AUTOGIT_RPMBUILD_DIR` selects another
 output directory.
 

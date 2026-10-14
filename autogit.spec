@@ -1,17 +1,14 @@
 Name:           autogit
-Version:        0.9.0
+Version:        0.9.1
 Release:        1
 Summary:        Automatic Git commit and synchronisation daemon
 License:        WTFPL
 URL:            https://github.com/awalland/autogit
 Source0:        %{name}-%{version}.tar.gz
-BuildRequires:  cargo >= 1.89
-BuildRequires:  rust >= 1.89
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libopenssl-devel
-BuildRequires:  libssh2-devel
 BuildRequires:  zlib-devel
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  dbus-1-daemon
