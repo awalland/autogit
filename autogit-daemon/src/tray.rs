@@ -398,21 +398,16 @@ fn format_time_ago(instant: Instant) -> String {
     }
 }
 
-// Helper functions to load icon pixel data from embedded PNG files
-// Icons are loaded at compile time and decoded to RGBA format
-// Returns (width, height, pixel_data)
-
 fn load_png_icon(png_bytes: &[u8]) -> (i32, i32, Vec<u8>) {
-    // Decode PNG image
     let img = image::load_from_memory(png_bytes).expect("Failed to decode icon PNG");
-
-    // Get dimensions
     let width = img.width() as i32;
     let height = img.height() as i32;
-
-    // Convert to RGBA8 format (required by StatusNotifierItem)
-    let rgba = img.to_rgba8();
-    let data = rgba.into_raw();
+    let mut data = img.into_rgba8().into_raw();
+    let (pixels, _) = data.as_chunks_mut::<4>();
+    // StatusNotifierItem requires ARGB32 bytes in network byte order.
+    for pixel in pixels {
+        pixel.rotate_right(1);
+    }
 
     (width, height, data)
 }
@@ -650,7 +645,7 @@ mod tests {
         assert!(width > 0);
         assert!(height > 0);
         assert!(!data.is_empty());
-        // RGBA format means 4 bytes per pixel
+        // ARGB32 has four bytes per pixel.
         assert_eq!(data.len(), (width * height * 4) as usize);
 
         let (width, height, data) = create_syncing_icon();
@@ -664,6 +659,21 @@ mod tests {
         let (width, height, data) = create_pause_icon();
         assert!(width > 0);
         assert_eq!(data.len(), (width * height * 4) as usize);
+    }
+
+    #[test]
+    fn png_pixels_preserve_colour_and_alpha_in_argb_order() {
+        use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+        let rgba = [255, 0, 0, 255, 10, 20, 30, 64, 70, 80, 90, 0];
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, 3, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+
+        let (width, height, argb) = load_png_icon(&png);
+        assert_eq!((width, height), (3, 1));
+        assert_eq!(argb, [255, 255, 0, 0, 64, 10, 20, 30, 0, 70, 80, 90]);
     }
 
     #[test]
