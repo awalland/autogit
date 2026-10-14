@@ -313,28 +313,21 @@ fn display_daemon_status(response: Response) -> Result<()> {
         "→".blue(),
         config.repositories.len()
     );
-    for repo in config.repositories {
+    for repo in &config.repositories {
         let enabled = if repo.auto_commit {
             "enabled"
         } else {
             "disabled"
         };
-        println!("  {} ({})", repo.path.display(), enabled);
-    }
-    for detail in details {
-        if let Some(error) = detail.error {
-            println!("  {}: {}", detail.path.display(), error.red());
-        } else {
-            println!(
-                "  {}: {}",
-                detail.path.display(),
-                if detail.committed {
-                    "committed"
-                } else {
-                    "checked"
-                }
-            );
-        }
+        let result = match details.iter().find(|detail| detail.path == repo.path) {
+            Some(detail) => match &detail.error {
+                Some(error) => error.red().to_string(),
+                None if detail.committed => "committed".to_owned(),
+                None => "checked".to_owned(),
+            },
+            None => "not checked yet".to_owned(),
+        };
+        println!("  {} ({}): {}", repo.path.display(), enabled, result);
     }
     Ok(())
 }
