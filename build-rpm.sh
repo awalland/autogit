@@ -13,7 +13,7 @@ if (( $# > 1 )); then
 fi
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for tool in cargo rpmbuild python3; do
+for tool in cargo rustc rpmbuild python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Error: $tool is required to build the RPM." >&2
         exit 1
