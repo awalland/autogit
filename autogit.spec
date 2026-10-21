@@ -1,5 +1,5 @@
 Name:           autogit
-Version:        0.9.1
+Version:        0.9.2
 Release:        1
 Summary:        Automatic Git commit and synchronisation daemon
 License:        WTFPL
