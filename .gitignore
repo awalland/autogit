@@ -17,3 +17,4 @@ Thumbs.db
 test-config.toml
 autogit/completions/
 *.profraw
+/publish.env
